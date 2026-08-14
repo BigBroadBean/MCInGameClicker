@@ -34,6 +34,7 @@ gatk=0
 gplace=0
 gcursor=0
 dbgClicks=1
+dbgDump=1
 "@ | Set-Content -Path $ini -Encoding ascii
 
 # 启动假客户端 (后台)

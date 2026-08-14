@@ -1,6 +1,13 @@
 //============================================================================
-//  MCInGame.dll  (v1.0)
+//  MCInGame.dll  (v1.2)
 //  注入到 Minecraft (java/javaw) 进程中的游戏内连点器。
+//
+//  v1.2 菜单 (按原连点器 v2.9 的 UI 设计重做):
+//    * 独立分层悬浮窗 + 内存 DC 双缓存合成 (UpdateLayeredWindow, 不闪烁)
+//    * 玻璃开关 / 可见滑块条 (轨道+填充+拇指) / 档位块 10·20·30·40
+//    * CPS 5~50 连续可调 (拖动/点轨道/滚轮/←→ 按住连滑)
+//    * 7 个可自定义快捷键 (回车/←→/点击进入绑定, 支持鼠标侧键, 有 Toast 反馈)
+//    * 悬浮提示 + 点击菜单外快速关闭
 //
 //  与旧项目 (MCCombatStatusJni) 的区别 (按需求对齐参考实现):
 //    * 不再通过共享内存/UDP 对外发布状态 —— 交互全部发生在游戏内:
@@ -106,7 +113,7 @@ static void Log(const char* fmt, ...)
 // 设置 (INI) —— %APPDATA%\MCInGameClicker\settings.ini
 //--------------------------------------------------------------------------
 static const int kCpsMin = 5;
-static const int kCpsMax = 100;
+static const int kCpsMax = 50;    // 上限 50 (与原连点器默认上限一致)
 
 struct Settings {
     int master;      // 总开关 (连点)
@@ -126,11 +133,12 @@ struct Settings {
     int hotGplace;   // 能放置闸门热键
     int hotGcursor;  // 视角闸门热键
     int dbgClicks;   // 调试: 记录每次 click 与状态变化到日志
+    int dbgDump;     // 调试: 菜单打开时把合成帧存成 BMP (%TEMP%\MCInGameMenu.bmp)
 };
 
 // 默认热键: F8 总开关 / F6 左键 / F7 右键 / F9 保持 (F6=117 F7=118 F8=119 F9=120)
 static Settings g_s = { 0, 1, 1, 20, 20, 0, 0, 0, 0,
-                        119, 117, 118, 120, 0, 0, 0, 0 };
+                        119, 117, 118, 120, 0, 0, 0, 0, 0 };
 
 static int clampCps(int v)
 {
@@ -188,6 +196,7 @@ static void LoadSettings(void)
         else if (!strcmp(k, "hotGplace")) g_s.hotGplace = ReadInt(v);
         else if (!strcmp(k, "hotGcursor"))g_s.hotGcursor = ReadInt(v);
         else if (!strcmp(k, "dbgClicks")) g_s.dbgClicks = ReadInt(v);
+        else if (!strcmp(k, "dbgDump"))   g_s.dbgDump   = ReadInt(v);
     }
     fclose(f);
     ClampCps();
@@ -208,11 +217,11 @@ static void SaveSettings(void)
         "master=%d\nleft=%d\nright=%d\ncpsLeft=%d\ncpsRight=%d\n"
         "keep=%d\ngatk=%d\ngplace=%d\ngcursor=%d\n"
         "hotMaster=%d\nhotLeft=%d\nhotRight=%d\nhotKeep=%d\n"
-        "hotGatk=%d\nhotGplace=%d\nhotGcursor=%d\ndbgClicks=%d\n",
+        "hotGatk=%d\nhotGplace=%d\nhotGcursor=%d\ndbgClicks=%d\ndbgDump=%d\n",
         g_s.master, g_s.left, g_s.right, g_s.cpsLeft, g_s.cpsRight,
         g_s.keep, g_s.gatk, g_s.gplace, g_s.gcursor,
         g_s.hotMaster, g_s.hotLeft, g_s.hotRight, g_s.hotKeep,
-        g_s.hotGatk, g_s.hotGplace, g_s.hotGcursor, g_s.dbgClicks);
+        g_s.hotGatk, g_s.hotGplace, g_s.hotGcursor, g_s.dbgClicks, g_s.dbgDump);
     fclose(f);
 }
 
@@ -222,14 +231,19 @@ static void SaveSettings(void)
 //       每帧一次 UpdateLayeredWindow 交给 DWM —— 不再往游戏前缓冲上
 //       画 GDI, 彻底消除闪烁。
 //--------------------------------------------------------------------------
-static const int MENU_W = 360;
-static const int TITLE_H = 26, INFO_H = 17, ROW_H = 22;
+static const int MENU_W = 380;
+static const int TITLE_H = 26, INFO_H = 17, ROW_H = 24;
+static const int CPS_ROW_H = 46;                        // CPS 行 (含滑块+档位)
 static const int ITEM_COUNT = 16;                       // 9 功能项 + 7 热键项
 static const int ITEM_TOP = TITLE_H + INFO_H * 2 + 6;
-static const int MENU_H = TITLE_H + INFO_H * 2 + 6 + ITEM_COUNT * ROW_H + 6 + 36 + 4;
 static const int TOOL_W = 230;                          // 悬浮提示区
 static const int OVL_W = MENU_W + TOOL_W;
-static const int OVL_H = MENU_H;
+
+// CPS 滑块几何 (在 CPS 行的第二行)
+static const int CPS_TRACK_L = 112;                     // 轨道左
+static const int CPS_CHIP_W = 26, CPS_CHIP_GAP = 4;     // 档位块
+static const int CPS_CHIP_COUNT = 4;
+static const int kCpsChips[CPS_CHIP_COUNT] = { 10, 20, 30, 40 };
 
 enum ItemId { IT_MASTER = 0, IT_LEFT, IT_RIGHT, IT_CPSL, IT_CPSR,
               IT_KEEP, IT_GATK, IT_GPLACE, IT_CURSOR,
@@ -259,8 +273,8 @@ static const wchar_t* const kItemTips[ITEM_COUNT] = {
     L"连点总开关；关闭后左右键都不连点",
     L"开=按住左键连点；保持模式开启时无需按住",
     L"开=按住右键连点；保持模式开启时无需按住",
-    L"左键每秒点击次数 (5~100)；按住左右拖动 / 滚轮 / ←→ 调整",
-    L"右键每秒点击次数 (5~100)；按住左右拖动 / 滚轮 / ←→ 调整",
+    L"左键每秒点击次数 (5~50)；按住左右拖动 / 滚轮 / ←→ 调整",
+    L"右键每秒点击次数 (5~50)；按住左右拖动 / 滚轮 / ←→ 调整",
     L"开=无需按住鼠标持续连点；关=按住左/右键才点",
     L"开=仅准星瞄准可攻击生物时才点左键",
     L"开=仅手持放置物 (方块类) 时才点右键",
@@ -274,6 +288,22 @@ static const wchar_t* const kItemTips[ITEM_COUNT] = {
     L"回车后按下新按键绑定，Esc 取消；0=无",
 };
 
+// 行布局: CPS 行高 46 (两行内容), 其余 24
+static int RowH(int i)
+{
+    return (i == IT_CPSL || i == IT_CPSR) ? CPS_ROW_H : ROW_H;
+}
+static int RowY(int i)
+{
+    int y = ITEM_TOP;
+    for (int k = 0; k < i && k < ITEM_COUNT; ++k) y += RowH(k);
+    return y;
+}
+static int MenuH(void)
+{
+    return RowY(ITEM_COUNT) + 6 + 36 + 4;
+}
+
 static volatile LONG g_menuOpen = 0;
 static volatile LONG g_sel      = 0;
 static volatile LONG g_hover    = -1;    // 鼠标悬停项 (悬浮提示)
@@ -283,6 +313,27 @@ static int   g_dragX = 0, g_dragVal = 0;
 static bool  g_prevInsert = false;
 static HWND  g_hwnd       = NULL;
 static WNDPROC g_origWndProc = NULL;
+
+// Toast (热键切换/绑定反馈, 与原连点器一致的提示方式)
+static wchar_t g_toast[128];
+static DWORD g_toastUntil = 0;
+
+static void ShowToast(const wchar_t* text)
+{
+    wcsncpy(g_toast, text, 127);
+    g_toast[127] = 0;
+    g_toastUntil = GetTickCount() + 1400;
+}
+
+// 热键项 -> 功能项 映射与短名
+static const int kHotTarget[7] = { IT_MASTER, IT_LEFT, IT_RIGHT, IT_KEEP,
+                                   IT_GATK, IT_GPLACE, IT_CURSOR };
+static const wchar_t* const kHotShortName[7] = {
+    L"总开关", L"左键连点", L"右键连点", L"保持连点",
+    L"能攻击闸门", L"能放置闸门", L"视角闸门",
+};
+
+static void VkNameW(int vk, wchar_t* out, int cap);   // 前向声明 (定义在绘制区)
 
 // 分层悬浮窗 + 双缓存位图
 static HWND  g_ovl = NULL;
@@ -304,6 +355,8 @@ static const COLORREF CLR_ON   = RGB(96, 208, 140);
 static const COLORREF CLR_OFF  = RGB(240, 96, 110);
 static const COLORREF CLR_WHT  = RGB(255, 255, 255);
 static const COLORREF CLR_BRD  = RGB(110, 122, 150);
+static const COLORREF CLR_ACC  = RGB(99, 166, 255);    // 强调色 (v2.9 同款蓝)
+static const COLORREF CLR_TRACK = RGB(56, 64, 88);     // 滑块轨道/开关关闭态
 
 // 点击状态 (渲染线程单线程访问)
 static bool  g_downL = false, g_downR = false;
@@ -312,7 +365,7 @@ static DWORD g_lastFrame = 0;
 
 static HFONT  g_fTitle = NULL, g_fRow = NULL, g_fDim = NULL;
 static HBRUSH g_brBg = NULL, g_brSel = NULL, g_brBorder = NULL, g_brSep = NULL;
-static HBRUSH g_brTip = NULL;
+static HBRUSH g_brTip = NULL, g_brAcc = NULL, g_brTrack = NULL, g_brKnob = NULL;
 
 static void ReleaseClick(bool left);   // 前向声明
 
@@ -411,6 +464,10 @@ static void BindHotkey(int item, int vk)
     }
     *p = vk;
     ItemChanged();
+    wchar_t kn[40], t[96];
+    VkNameW(vk, kn, 40);
+    swprintf(t, 96, L"%ls 已绑定 %ls", kHotShortName[item - IT_HOTMASTER], kn);
+    ShowToast(t);
     Log("hotkey bound: item=%d vk=%d", item, vk);
 }
 
@@ -426,22 +483,27 @@ static void DoHotkey(int vk)
 {
     for (int i = IT_HOTMASTER; i <= IT_HOTCURSOR; ++i) {
         if (HotkeyOf(i) != vk) continue;
+        bool nowOn = false;
         switch (i) {
-        case IT_HOTMASTER: g_s.master = !g_s.master; break;
-        case IT_HOTLEFT:   g_s.left   = !g_s.left;   break;
-        case IT_HOTRIGHT:  g_s.right  = !g_s.right;  break;
-        case IT_HOTKEEP:   g_s.keep   = !g_s.keep;   break;
-        case IT_HOTGATK:   g_s.gatk   = !g_s.gatk;   break;
-        case IT_HOTGPLACE: g_s.gplace = !g_s.gplace; break;
-        case IT_HOTCURSOR: g_s.gcursor = !g_s.gcursor; break;
+        case IT_HOTMASTER: g_s.master = !g_s.master; nowOn = g_s.master != 0; break;
+        case IT_HOTLEFT:   g_s.left   = !g_s.left;   nowOn = g_s.left != 0; break;
+        case IT_HOTRIGHT:  g_s.right  = !g_s.right;  nowOn = g_s.right != 0; break;
+        case IT_HOTKEEP:   g_s.keep   = !g_s.keep;   nowOn = g_s.keep != 0; break;
+        case IT_HOTGATK:   g_s.gatk   = !g_s.gatk;   nowOn = g_s.gatk != 0; break;
+        case IT_HOTGPLACE: g_s.gplace = !g_s.gplace; nowOn = g_s.gplace != 0; break;
+        case IT_HOTCURSOR: g_s.gcursor = !g_s.gcursor; nowOn = g_s.gcursor != 0; break;
         default: return;
         }
-        if (i == IT_HOTMASTER && !g_s.master) {
+        if (i == IT_HOTMASTER && !nowOn) {
             ReleaseClick(true);
             ReleaseClick(false);
             g_accL = g_accR = 0;
         }
         ItemChanged();
+        wchar_t t[64];
+        swprintf(t, 64, L"%ls %ls", kHotShortName[i - IT_HOTMASTER],
+                 nowOn ? L"开" : L"关");
+        ShowToast(t);
         Log("hotkey vk=%d -> item=%d", vk, i);
         return;
     }
@@ -504,10 +566,20 @@ static LRESULT CALLBACK MenuWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN:        // 点在菜单面板外 -> 快速关闭
         CloseMenu();
         return 0;
+    case WM_MBUTTONDOWN: case WM_XBUTTONDOWN: {
+        // 绑定模式下鼠标中键/侧键也可作为热键 (左右键不允许, 与原版一致)
+        if (g_capturing >= 0) {
+            int vk = (msg == WM_MBUTTONDOWN) ? VK_MBUTTON
+                   : ((HIWORD(wp) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2);
+            BindHotkey((int)g_capturing, vk);
+            g_capturing = -1;
+        }
+        return 0;
+    }
     case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
     case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
-    case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
-    case WM_XBUTTONDOWN: case WM_XBUTTONUP:
+    case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+    case WM_XBUTTONUP:
     case WM_MOUSEWHEEL:
     case WM_MOUSEMOVE:
         return 0;
@@ -569,6 +641,9 @@ static void EnsureUiObjects(void)
     if (!g_brBorder) g_brBorder = CreateSolidBrush(CLR_BRD);
     if (!g_brSep)    g_brSep    = CreateSolidBrush(CLR_SEP);
     if (!g_brTip)    g_brTip    = CreateSolidBrush(CLR_TIP);
+    if (!g_brAcc)    g_brAcc    = CreateSolidBrush(CLR_ACC);
+    if (!g_brTrack)  g_brTrack  = CreateSolidBrush(CLR_TRACK);
+    if (!g_brKnob)   g_brKnob   = CreateSolidBrush(CLR_WHT);
 }
 
 static void AtoW(const char* s, wchar_t* out, int cap)
@@ -631,8 +706,28 @@ static int ItemBool(int i)
 static int HitItem(int x, int y)
 {
     if (x < 0 || x >= MENU_W) return -1;
-    if (y < ITEM_TOP || y >= ITEM_TOP + ITEM_COUNT * ROW_H) return -1;
-    return (y - ITEM_TOP) / ROW_H;
+    for (int i = 0; i < ITEM_COUNT; ++i) {
+        if (y >= RowY(i) && y < RowY(i) + RowH(i)) return i;
+    }
+    return -1;
+}
+
+// CPS 行内子区域: 0=无 1=滑块轨道 2..5=档位块 (索引+2)
+static int CpsHitZone(int item, int x, int y)
+{
+    if (item != IT_CPSL && item != IT_CPSR) return 0;
+    int sl = RowY(item) + 24;
+    if (y < sl - 8 || y > sl + 10) return 0;
+    int chipsL = MENU_W - 12 - (CPS_CHIP_W + CPS_CHIP_GAP) * CPS_CHIP_COUNT;
+    if (x >= chipsL) {
+        for (int k = 0; k < CPS_CHIP_COUNT; ++k) {
+            int x0 = chipsL + k * (CPS_CHIP_W + CPS_CHIP_GAP);
+            if (x >= x0 && x < x0 + CPS_CHIP_W) return 2 + k;
+        }
+        return 0;
+    }
+    if (x >= CPS_TRACK_L && x <= chipsL - 6) return 1;
+    return 0;
 }
 
 // 悬浮窗消息处理: 点击/拖动滑 CPS/滚轮/悬停
@@ -643,18 +738,27 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (!g_menuOpen) break;
         POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
         int item = HitItem(pt.x, pt.y);
-        if (item >= 0) {
-            g_sel = item;
-            if (item == IT_CPSL || item == IT_CPSR) {
+        if (item < 0) return 0;
+        g_sel = item;
+        if (item == IT_CPSL || item == IT_CPSR) {
+            int zone = CpsHitZone(item, pt.x, pt.y);
+            if (zone >= 2) {                     // 点档位块: 直接设值
+                int v = kCpsChips[zone - 2];
+                if (item == IT_CPSL) g_s.cpsLeft = v; else g_s.cpsRight = v;
+                ItemChanged();
+            } else if (zone == 1) {              // 点轨道: 跳值并进入拖动
+                int v = clampCps(kCpsMin + (pt.x - CPS_TRACK_L) / 2);
+                if (item == IT_CPSL) g_s.cpsLeft = v; else g_s.cpsRight = v;
+                ItemChanged();
                 g_dragItem = item;
                 g_dragX = pt.x;
-                g_dragVal = (item == IT_CPSL) ? g_s.cpsLeft : g_s.cpsRight;
+                g_dragVal = v;
                 SetCapture(h);
-            } else if (item >= IT_HOTMASTER && item <= IT_HOTCURSOR) {
-                g_capturing = item;
-            } else {
-                ToggleItem();
             }
+        } else if (item >= IT_HOTMASTER && item <= IT_HOTCURSOR) {
+            g_capturing = item;                  // 点热键行直接进入绑定
+        } else {
+            ToggleItem();
         }
         return 0;
     }
@@ -708,7 +812,7 @@ static bool EnsureOverlay(void)
     g_ovl = CreateWindowExA(
         WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         kOvlClass, "MCInGame", WS_POPUP,
-        0, 0, OVL_W, OVL_H, NULL, NULL, inst, NULL);
+        0, 0, OVL_W, MenuH(), NULL, NULL, inst, NULL);
     if (g_ovl) Log("overlay window created");
     return g_ovl != NULL;
 }
@@ -723,7 +827,7 @@ static bool EnsureBackbuffer(void)
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bi.bmiHeader.biWidth = OVL_W;
-    bi.bmiHeader.biHeight = -OVL_H;          // top-down
+    bi.bmiHeader.biHeight = -MenuH();        // top-down
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
@@ -735,7 +839,7 @@ static bool EnsureBackbuffer(void)
     }
     SelectObject(g_memDC, g_dib);
     g_bitsW = OVL_W;
-    g_bitsH = OVL_H;
+    g_bitsH = MenuH();
     return true;
 }
 
@@ -750,6 +854,7 @@ static void ApplyAlpha(void)
             BYTE* px = row + (size_t)x * 4;
             if (px[3] != 0) continue;    // 已是透明区
             COLORREF c = RGB(px[2], px[1], px[0]);
+            if (c == 0) continue;    // 透明区 (0,0,0) 保持透明, 不能提升 alpha
             if (c == CLR_BG) {
                 px[0] = px[0] * 210 / 255;
                 px[1] = px[1] * 210 / 255;
@@ -767,6 +872,74 @@ static void ApplyAlpha(void)
     }
 }
 
+// ---- GDI 圆角/椭圆填充辅助 ----
+static void FillRound(HDC dc, const RECT& r, int rad, HBRUSH br)
+{
+    HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
+    HGDIOBJ ob = SelectObject(dc, br);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+}
+static void RingRound(HDC dc, const RECT& r, int rad, COLORREF color)
+{
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    HGDIOBJ op = SelectObject(dc, pen);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+    DeleteObject(pen);
+}
+static void FillEll(HDC dc, const RECT& r, HBRUSH br)
+{
+    HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
+    HGDIOBJ ob = SelectObject(dc, br);
+    Ellipse(dc, r.left, r.top, r.right, r.bottom);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+}
+
+// 玻璃开关 (v2.9 GToggle 同款结构: 圆角轨道 + 白色旋钮)
+static void DrawSwitch(HDC dc, const RECT& r, bool on)
+{
+    FillRound(dc, r, 12, on ? g_brAcc : g_brTrack);
+    int cy = (r.top + r.bottom) / 2;
+    int kr = (r.bottom - r.top) / 2 - 3;
+    int kx = on ? r.right - kr - 3 : r.left + kr + 3;
+    RECT krr = { kx - kr, cy - kr, kx + kr, cy + kr };
+    FillEll(dc, krr, g_brKnob);
+}
+
+// CPS 滑块: 轨道 + 强调色填充 + 白色拇指 + 档位块
+static void DrawSlider(HDC dc, int item, int value)
+{
+    int y = RowY(item) + 24;
+    int chipsL = MENU_W - 12 - (CPS_CHIP_W + CPS_CHIP_GAP) * CPS_CHIP_COUNT;
+    int trackR = chipsL - 6;
+    RECT trk = { CPS_TRACK_L, y - 3, trackR, y + 3 };
+    FillRound(dc, trk, 4, g_brTrack);
+    int tx = CPS_TRACK_L + (value - kCpsMin) * (trackR - CPS_TRACK_L) / (kCpsMax - kCpsMin);
+    if (tx > CPS_TRACK_L + 2) {
+        RECT fill = { CPS_TRACK_L, y - 3, tx, y + 3 };
+        FillRound(dc, fill, 4, g_brAcc);
+    }
+    RECT thumb = { tx - 6, y - 6, tx + 6, y + 6 };
+    FillEll(dc, thumb, g_brKnob);
+
+    for (int k = 0; k < CPS_CHIP_COUNT; ++k) {
+        RECT ch = { chipsL + k * (CPS_CHIP_W + CPS_CHIP_GAP), y - 8,
+                    chipsL + k * (CPS_CHIP_W + CPS_CHIP_GAP) + CPS_CHIP_W, y + 8 };
+        if (kCpsChips[k] == value) FillRound(dc, ch, 6, g_brAcc);
+        else RingRound(dc, ch, 6, CLR_BRD);
+        wchar_t lb[8];
+        swprintf(lb, 8, L"%d", kCpsChips[k]);
+        SelectObject(dc, g_fDim);
+        SetTextColor(dc, (kCpsChips[k] == value) ? CLR_WHT : CLR_DIM);
+        DrawTextW(dc, lb, -1, (RECT*)&ch, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
 static void ComposeFrame(void)
 {
     if (!EnsureBackbuffer()) return;
@@ -774,22 +947,28 @@ static void ComposeFrame(void)
     HDC dc = g_memDC;
     EnsureUiObjects();
 
-    RECT panel = { 0, 0, MENU_W, MENU_H };
-    FillRect(dc, &panel, g_brBg);
-    FrameRect(dc, &panel, g_brBorder);
+    int mh = MenuH();
+    RECT panel = { 0, 0, MENU_W, mh };
+    FillRound(dc, panel, 10, g_brBg);
+    RingRound(dc, panel, 10, CLR_BRD);
     SetBkMode(dc, TRANSPARENT);
 
-    // 标题
+    // 标题 + 强调线
     SelectObject(dc, g_fTitle);
     SetTextColor(dc, CLR_WHT);
     RECT rt = { 12, 0, MENU_W - 12, TITLE_H };
-    DrawTextW(dc, L"MCInGame 连点器  v1.1", -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextW(dc, L"MCInGame 连点器  v1.2", -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT rl = { 12, TITLE_H - 1, MENU_W - 12, TITLE_H };
+    FillRect(dc, &rl, g_brAcc);
 
-    // 状态行
+    // 状态行 (绑定热键时显示绑定指引)
     SelectObject(dc, g_fDim);
     SetTextColor(dc, CLR_DIM);
     wchar_t st[256];
-    if (g_status->ready) {
+    if (g_capturing >= 0) {
+        swprintf(st, 256, L"正在绑定「%ls」— 请按下新键… (Esc 取消)",
+                 kItemNames[g_capturing]);
+    } else if (g_status->ready) {
         wchar_t map[40], ver[32];
         AtoW(g_status->mappingName, map, 40);
         AtoW(g_gameVer, ver, 32);
@@ -817,63 +996,81 @@ static void ComposeFrame(void)
     DrawTextW(dc, live, -1, &r2, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     // 分隔线
-    RECT sep1 = { 6, TITLE_H + INFO_H * 2 + 2, MENU_W - 6, TITLE_H + INFO_H * 2 + 3 };
+    RECT sep1 = { 8, TITLE_H + INFO_H * 2 + 2, MENU_W - 8, TITLE_H + INFO_H * 2 + 3 };
     FillRect(dc, &sep1, g_brSep);
 
     // 菜单项
     for (int i = 0; i < ITEM_COUNT; ++i) {
-        RECT rr = { 6, ITEM_TOP + i * ROW_H, MENU_W - 6, ITEM_TOP + (i + 1) * ROW_H };
-        if (i == g_sel) FillRect(dc, &rr, g_brSel);
-        SelectObject(dc, g_fRow);
-        SetTextColor(dc, CLR_TXT);
-        RECT rn = { rr.left + 8, rr.top, rr.right - 84, rr.bottom };
-        DrawTextW(dc, kItemNames[i], -1, &rn, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        int ry = RowY(i), rh = RowH(i);
+        RECT rr = { 6, ry, MENU_W - 6, ry + rh };
+        if (i == g_sel) FillRound(dc, rr, 8, g_brSel);
+        else if (i == g_hover) RingRound(dc, rr, 8, CLR_BRD);
 
-        RECT rv = { rr.right - 80, rr.top, rr.right - 6, rr.bottom };
-        wchar_t val[40];
-        if (i == g_capturing) {
-            wcscpy(val, L"按新键…");
-            SetTextColor(dc, CLR_ON);
-        } else if (i == IT_CPSL) {
-            swprintf(val, 40, L"%d/s", g_s.cpsLeft);
-            SetTextColor(dc, CLR_WHT);
-        } else if (i == IT_CPSR) {
-            swprintf(val, 40, L"%d/s", g_s.cpsRight);
-            SetTextColor(dc, CLR_WHT);
-        } else if (i >= IT_HOTMASTER && i <= IT_HOTCURSOR) {
-            VkNameW(HotkeyOf(i), val, 40);
-            SetTextColor(dc, CLR_WHT);
-        } else if (ItemBool(i)) {
-            wcscpy(val, L"开");
-            SetTextColor(dc, CLR_ON);
+        if (i == IT_CPSL || i == IT_CPSR) {
+            // CPS 行: 名称 + 值 + 滑块 + 档位
+            SelectObject(dc, g_fRow);
+            SetTextColor(dc, CLR_TXT);
+            RECT rn = { rr.left + 8, ry, 120, ry + 24 };
+            DrawTextW(dc, kItemNames[i], -1, &rn, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            int v = (i == IT_CPSL) ? g_s.cpsLeft : g_s.cpsRight;
+            wchar_t val[16];
+            swprintf(val, 16, L"%d/s", v);
+            SetTextColor(dc, CLR_ACC);
+            RECT rv = { MENU_W - 78, ry, MENU_W - 12, ry + 24 };
+            DrawTextW(dc, val, -1, &rv, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            DrawSlider(dc, i, v);
         } else {
-            wcscpy(val, L"关");
-            SetTextColor(dc, CLR_OFF);
+            SelectObject(dc, g_fRow);
+            SetTextColor(dc, CLR_TXT);
+            RECT rn = { rr.left + 8, rr.top, rr.right - 96, rr.bottom };
+            DrawTextW(dc, kItemNames[i], -1, &rn, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            if (i >= IT_HOTMASTER && i <= IT_HOTCURSOR) {
+                // 热键槽
+                RECT slot = { MENU_W - 90, ry + 3, MENU_W - 12, ry + rh - 3 };
+                if (i == g_capturing) {
+                    FillRound(dc, slot, 8, g_brAcc);
+                    bool blink = ((GetTickCount() / 300) & 1) != 0;
+                    SetTextColor(dc, CLR_WHT);
+                    DrawTextW(dc, blink ? L"请按下新键…" : L"…", -1, &slot,
+                              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                } else {
+                    RingRound(dc, slot, 8, CLR_BRD);
+                    wchar_t kn[40];
+                    VkNameW(HotkeyOf(i), kn, 40);
+                    SetTextColor(dc, HotkeyOf(i) ? CLR_WHT : CLR_DIM);
+                    DrawTextW(dc, kn, -1, &slot, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                }
+            } else {
+                // 玻璃开关
+                RECT sw = { MENU_W - 52, ry + 4, MENU_W - 12, ry + rh - 4 };
+                DrawSwitch(dc, sw, ItemBool(i) != 0);
+            }
         }
-        DrawTextW(dc, val, -1, &rv, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
 
     // 分隔线
-    RECT sep2 = { 6, ITEM_TOP + ITEM_COUNT * ROW_H + 2, MENU_W - 6, ITEM_TOP + ITEM_COUNT * ROW_H + 3 };
+    RECT sep2 = { 8, RowY(ITEM_COUNT) + 2, MENU_W - 8, RowY(ITEM_COUNT) + 3 };
     FillRect(dc, &sep2, g_brSep);
 
     // 底部提示
     SelectObject(dc, g_fDim);
     SetTextColor(dc, CLR_DIM);
-    RECT rf1 = { 12, ITEM_TOP + ITEM_COUNT * ROW_H + 6, MENU_W - 12, ITEM_TOP + ITEM_COUNT * ROW_H + 22 };
+    int fy = RowY(ITEM_COUNT) + 6;
+    RECT rf1 = { 12, fy, MENU_W - 12, fy + 16 };
     DrawTextW(dc, L"Insert/Esc 或点菜单外关闭 · ↑↓ 选择 · ←→/回车 调整", -1, &rf1,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    RECT rf2 = { 12, ITEM_TOP + ITEM_COUNT * ROW_H + 22, MENU_W - 12, ITEM_TOP + ITEM_COUNT * ROW_H + 38 };
-    DrawTextW(dc, L"拖动/滚轮滑 CPS · 热键项回车绑定 · 设置自动保存", -1, &rf2,
+    RECT rf2 = { 12, fy + 16, MENU_W - 12, fy + 32 };
+    DrawTextW(dc, L"拖动滑块调 CPS · 点档位快速设值 · 热键项回车绑定", -1, &rf2,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     // 悬浮提示 (鼠标悬停时, 显示在面板右侧)
     if (g_hover >= 0 && g_hover < ITEM_COUNT) {
-        int ty = ITEM_TOP + g_hover * ROW_H;
-        if (ty + 46 > MENU_H) ty = MENU_H - 48;
+        int ty = RowY(g_hover);
+        if (ty + 46 > mh) ty = mh - 48;
         RECT tr = { MENU_W + 8, ty, OVL_W - 8, ty + 46 };
-        FillRect(dc, &tr, g_brTip);
-        FrameRect(dc, &tr, g_brBorder);
+        FillRound(dc, tr, 8, g_brTip);
+        RingRound(dc, tr, 8, CLR_BRD);
         SetTextColor(dc, CLR_TXT);
         RECT tt = { tr.left + 6, tr.top + 3, tr.right - 6, tr.bottom - 3 };
         DrawTextW(dc, kItemTips[g_hover], -1, &tt,
@@ -883,22 +1080,87 @@ static void ComposeFrame(void)
     ApplyAlpha();
 }
 
-// 每帧: 菜单打开 -> 定位悬浮窗 + 合成 + 一次 UpdateLayeredWindow (原子呈现)
+// Toast 合成 (菜单关闭时, 热键切换/绑定的提示条)
+static void ComposeToast(void)
+{
+    if (!EnsureBackbuffer()) return;
+    memset(g_bits, 0, (size_t)g_bitsW * 4 * 36);
+    HDC dc = g_memDC;
+    EnsureUiObjects();
+    RECT tr = { 0, 2, OVL_W, 34 };
+    FillRound(dc, tr, 12, g_brBg);
+    RingRound(dc, tr, 12, CLR_ACC);
+    SetBkMode(dc, TRANSPARENT);
+    SelectObject(dc, g_fRow);
+    SetTextColor(dc, CLR_TXT);
+    RECT tt = { 10, 2, OVL_W - 10, 34 };
+    DrawTextW(dc, g_toast, -1, &tt, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    ApplyAlpha();
+}
+
+// 调试: 把合成帧存成 BMP (视觉检查用)
+static void DbgDumpFrame(void)
+{
+    if (!g_bits) return;
+    char path[MAX_PATH];
+    if (!GetTempPathA(MAX_PATH, path)) return;
+    strcpy(path + strlen(path), "MCInGameMenu.bmp");
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    BITMAPFILEHEADER fh = {};
+    fh.bfType = 0x4D42;
+    fh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+    fh.bfSize = fh.bfOffBits + (DWORD)(g_bitsW * 4 * g_bitsH);
+    BITMAPINFOHEADER ih = {};
+    ih.biSize = sizeof(ih);
+    ih.biWidth = g_bitsW;
+    ih.biHeight = -g_bitsH;      // top-down
+    ih.biPlanes = 1;
+    ih.biBitCount = 32;
+    ih.biCompression = BI_RGB;
+    fwrite(&fh, sizeof(fh), 1, f);
+    fwrite(&ih, sizeof(ih), 1, f);
+    fwrite(g_bits, 1, fh.bfSize - fh.bfOffBits, f);
+    fclose(f);
+}
+
+// 每帧: 菜单打开 -> 菜单悬浮窗; 菜单关闭 -> Toast 提示条; 都没有 -> 隐藏
 static void UpdateOverlay(void)
 {
-    if (!g_menuOpen || !g_hwnd || IsIconic(g_hwnd)) {
+    bool toastOn = !g_menuOpen && g_toast[0] && GetTickCount() < g_toastUntil;
+    if (!g_menuOpen && !toastOn) {
+        if (g_ovl && IsWindowVisible(g_ovl)) ShowWindow(g_ovl, SW_HIDE);
+        return;
+    }
+    if (!g_hwnd || IsIconic(g_hwnd)) {
         if (g_ovl && IsWindowVisible(g_ovl)) ShowWindow(g_ovl, SW_HIDE);
         return;
     }
     if (!EnsureOverlay() || !EnsureBackbuffer()) return;
-    POINT tl = { 10, 10 };
-    ClientToScreen(g_hwnd, &tl);
-    SetWindowPos(g_ovl, HWND_TOPMOST, tl.x, tl.y, OVL_W, OVL_H,
+
+    int w = OVL_W, h;
+    POINT tl;
+    if (g_menuOpen) {
+        h = MenuH();
+        POINT p = { 10, 10 };
+        ClientToScreen(g_hwnd, &p);
+        tl = p;
+        ComposeFrame();
+        if (g_s.dbgDump) DbgDumpFrame();
+    } else {
+        h = 36;
+        RECT wr;
+        GetClientRect(g_hwnd, &wr);
+        POINT p = { wr.right / 2 - w / 2, 8 };
+        ClientToScreen(g_hwnd, &p);
+        tl = p;
+        ComposeToast();
+    }
+    SetWindowPos(g_ovl, HWND_TOPMOST, tl.x, tl.y, w, h,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    ComposeFrame();
     BLENDFUNCTION bf = { AC_SRC_ALPHA, 0, 255, 0 };
     POINT src = { 0, 0 };
-    SIZE sz = { OVL_W, OVL_H };
+    SIZE sz = { w, h };
     UpdateLayeredWindow(g_ovl, NULL, NULL, &sz, g_memDC, &src, 0, &bf, ULW_ALPHA);
 }
 
