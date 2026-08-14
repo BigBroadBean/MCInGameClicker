@@ -57,8 +57,13 @@ Write-Host "target pid=$($proc.ProcessId)"
 & "$root\injector.exe" -pid $proc.ProcessId
 Write-Host "injector exit=$LASTEXITCODE"
 
+# 12 秒后远程打开菜单, 验证悬浮窗创建/双缓存合成不崩
+Start-Sleep -Seconds 12
+& "$root\injector.exe" -pid $proc.ProcessId -menu
+Write-Host "injector -menu exit=$LASTEXITCODE"
+
 # 等测试跑完 (总时长约 16s)
-Start-Sleep -Seconds 17
+Start-Sleep -Seconds 4
 
 # 收尾
 Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
@@ -83,6 +88,8 @@ $checks = @{
     'JNI 就绪'     = ($c -match 'ready: map=mojang');
     '状态变化'     = ($c -match 'status canAtk=');
     '点击日志'     = ($c -match 'click L down');
+    '菜单打开'     = ($c -match 'menu open');
+    '悬浮窗创建'   = ($c -match 'overlay window created');
 }
 $ok = $true
 foreach ($k in $checks.Keys) {

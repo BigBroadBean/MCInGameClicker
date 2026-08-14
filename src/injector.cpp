@@ -146,6 +146,7 @@ int main(int argc, char** argv)
     SetConsoleOutputCP(CP_UTF8); // 中文输出
 
     DWORD pid = 0;
+    bool g_openMenu = false;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-pid") == 0 && i + 1 < argc) {
@@ -157,8 +158,11 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "-dll") == 0 && i + 1 < argc) {
             snprintf(g_dllPath, sizeof(g_dllPath), "%s", argv[++i]);
         }
+        else if (strcmp(argv[i], "-menu") == 0) {
+            g_openMenu = true;   // 注入后自动打开游戏内菜单 (调试/测试)
+        }
         else {
-            printf("用法: injector.exe [-pid <PID>] [-title <窗口标题子串>] [-dll <DLL路径>]\n");
+            printf("用法: injector.exe [-pid <PID>] [-title <窗口标题子串>] [-dll <DLL路径>] [-menu]\n");
             return 1;
         }
     }
@@ -202,9 +206,31 @@ int main(int argc, char** argv)
     }
 
     // 注入
+    // -menu: 若 DLL 已注入过 (事件已存在), 只发打开菜单命令, 绝不重复注入
+    //        (重复 LoadLibrary 会加载第二份副本, 且副本留在模块列表里)
+    if (g_openMenu) {
+        HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Local\\MCInGameMenuEvent");
+        if (ev) {
+            SetEvent(ev);
+            CloseHandle(ev);
+            printf("[+] 已发送打开菜单命令 (进程此前已注入)。\n");
+            return 0;
+        }
+    }
+
     printf("[*] 注入 %s ...\n", dllPath);
     if (!InjectDll(pid, dllPath)) return 1;
     printf("[+] 注入完成。\n");
+    if (g_openMenu) {
+        HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Local\\MCInGameMenuEvent");
+        if (ev) {
+            SetEvent(ev);
+            CloseHandle(ev);
+            printf("[+] 已发送打开菜单命令。\n");
+        } else {
+            printf("[!] 打开菜单命令发送失败。\n");
+        }
+    }
     printf("    游戏中按 Insert 呼出菜单 (↑↓ 选择 / ←→ 回车 调整 / Esc 关闭)\n");
     printf("    设置: %%APPDATA%%\\MCInGameClicker\\settings.ini\n");
     printf("    日志: %%TEMP%%\\MCInGameClicker.log\n");

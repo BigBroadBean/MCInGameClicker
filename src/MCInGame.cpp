@@ -105,24 +105,39 @@ static void Log(const char* fmt, ...)
 //--------------------------------------------------------------------------
 // 设置 (INI) —— %APPDATA%\MCInGameClicker\settings.ini
 //--------------------------------------------------------------------------
-static const int kCpsPresets[]    = { 10, 15, 20, 25, 30, 35, 40, 45, 50 };
-static const int kCpsPresetCount  = (int)(sizeof(kCpsPresets) / sizeof(kCpsPresets[0]));
+static const int kCpsMin = 5;
+static const int kCpsMax = 100;
 
 struct Settings {
     int master;      // 总开关 (连点)
     int left;        // 左键连点
     int right;       // 右键连点
-    int cpsLeft;     // 左键 CPS
-    int cpsRight;    // 右键 CPS
+    int cpsLeft;     // 左键 CPS (5~100, 连续)
+    int cpsRight;    // 右键 CPS (5~100, 连续)
     int keep;        // 保持连点 (无需按住鼠标)
     int gatk;        // 能攻击才点
     int gplace;      // 能放置才点
     int gcursor;     // 视角内才点 (光标隐藏时)
+    int hotMaster;   // 总开关热键 (VK 码, 0=无)
+    int hotLeft;     // 左键热键
+    int hotRight;    // 右键热键
+    int hotKeep;     // 保持热键
+    int hotGatk;     // 能攻击闸门热键
+    int hotGplace;   // 能放置闸门热键
+    int hotGcursor;  // 视角闸门热键
     int dbgClicks;   // 调试: 记录每次 click 与状态变化到日志
 };
 
-static Settings g_s = { 0, 1, 1, 20, 20, 0, 0, 0, 0, 0 };
-static int g_cpsIdxL = 2, g_cpsIdxR = 2;   // 索引 kCpsPresets (默认 20)
+// 默认热键: F8 总开关 / F6 左键 / F7 右键 / F9 保持 (F6=117 F7=118 F8=119 F9=120)
+static Settings g_s = { 0, 1, 1, 20, 20, 0, 0, 0, 0,
+                        119, 117, 118, 120, 0, 0, 0, 0 };
+
+static int clampCps(int v)
+{
+    if (v < kCpsMin) v = kCpsMin;
+    if (v > kCpsMax) v = kCpsMax;
+    return v;
+}
 
 static void IniPath(char* out, size_t cap)
 {
@@ -136,18 +151,10 @@ static void IniPath(char* out, size_t cap)
 
 static int ReadInt(const char* t) { return atoi(t ? t : "0"); }
 
-static void SnapPresets(void)
+static void ClampCps(void)
 {
-    g_cpsIdxL = g_cpsIdxR = 0;
-    int bestL = 100000, bestR = 100000;
-    for (int i = 0; i < kCpsPresetCount; ++i) {
-        int dL = abs(kCpsPresets[i] - g_s.cpsLeft);
-        if (dL < bestL) { bestL = dL; g_cpsIdxL = i; }
-        int dR = abs(kCpsPresets[i] - g_s.cpsRight);
-        if (dR < bestR) { bestR = dR; g_cpsIdxR = i; }
-    }
-    g_s.cpsLeft  = kCpsPresets[g_cpsIdxL];
-    g_s.cpsRight = kCpsPresets[g_cpsIdxR];
+    g_s.cpsLeft  = clampCps(g_s.cpsLeft);
+    g_s.cpsRight = clampCps(g_s.cpsRight);
 }
 
 static void LoadSettings(void)
@@ -173,10 +180,17 @@ static void LoadSettings(void)
         else if (!strcmp(k, "gatk"))      g_s.gatk      = ReadInt(v);
         else if (!strcmp(k, "gplace"))    g_s.gplace    = ReadInt(v);
         else if (!strcmp(k, "gcursor"))   g_s.gcursor   = ReadInt(v);
+        else if (!strcmp(k, "hotMaster")) g_s.hotMaster = ReadInt(v);
+        else if (!strcmp(k, "hotLeft"))   g_s.hotLeft   = ReadInt(v);
+        else if (!strcmp(k, "hotRight"))  g_s.hotRight  = ReadInt(v);
+        else if (!strcmp(k, "hotKeep"))   g_s.hotKeep   = ReadInt(v);
+        else if (!strcmp(k, "hotGatk"))   g_s.hotGatk   = ReadInt(v);
+        else if (!strcmp(k, "hotGplace")) g_s.hotGplace = ReadInt(v);
+        else if (!strcmp(k, "hotGcursor"))g_s.hotGcursor = ReadInt(v);
         else if (!strcmp(k, "dbgClicks")) g_s.dbgClicks = ReadInt(v);
     }
     fclose(f);
-    SnapPresets();
+    ClampCps();
 }
 
 static void SaveSettings(void)
@@ -192,23 +206,35 @@ static void SaveSettings(void)
     if (!f) return;
     fprintf(f,
         "master=%d\nleft=%d\nright=%d\ncpsLeft=%d\ncpsRight=%d\n"
-        "keep=%d\ngatk=%d\ngplace=%d\ngcursor=%d\ndbgClicks=%d\n",
+        "keep=%d\ngatk=%d\ngplace=%d\ngcursor=%d\n"
+        "hotMaster=%d\nhotLeft=%d\nhotRight=%d\nhotKeep=%d\n"
+        "hotGatk=%d\nhotGplace=%d\nhotGcursor=%d\ndbgClicks=%d\n",
         g_s.master, g_s.left, g_s.right, g_s.cpsLeft, g_s.cpsRight,
-        g_s.keep, g_s.gatk, g_s.gplace, g_s.gcursor, g_s.dbgClicks);
+        g_s.keep, g_s.gatk, g_s.gplace, g_s.gcursor,
+        g_s.hotMaster, g_s.hotLeft, g_s.hotRight, g_s.hotKeep,
+        g_s.hotGatk, g_s.hotGplace, g_s.hotGcursor, g_s.dbgClicks);
     fclose(f);
 }
 
 //--------------------------------------------------------------------------
-// 游戏内菜单 (Insert 呼出, GDI 叠加层)
+// 游戏内菜单 (Insert 呼出)
+// 渲染: 独立分层悬浮窗 (WS_EX_LAYERED) + 内存 DC 双缓存位图合成,
+//       每帧一次 UpdateLayeredWindow 交给 DWM —— 不再往游戏前缓冲上
+//       画 GDI, 彻底消除闪烁。
 //--------------------------------------------------------------------------
-static const int MENU_X = 10, MENU_Y = 10, MENU_W = 340;
-static const int TITLE_H = 28, INFO_H = 18, ROW_H = 24;
-static const int ITEM_COUNT = 9;
-static const int ITEM_TOP = MENU_Y + TITLE_H + INFO_H * 2 + 6;
-static const int MENU_H = TITLE_H + INFO_H * 2 + 6 + ITEM_COUNT * ROW_H + 6 + 38 + 6;
+static const int MENU_W = 360;
+static const int TITLE_H = 26, INFO_H = 17, ROW_H = 22;
+static const int ITEM_COUNT = 16;                       // 9 功能项 + 7 热键项
+static const int ITEM_TOP = TITLE_H + INFO_H * 2 + 6;
+static const int MENU_H = TITLE_H + INFO_H * 2 + 6 + ITEM_COUNT * ROW_H + 6 + 36 + 4;
+static const int TOOL_W = 230;                          // 悬浮提示区
+static const int OVL_W = MENU_W + TOOL_W;
+static const int OVL_H = MENU_H;
 
 enum ItemId { IT_MASTER = 0, IT_LEFT, IT_RIGHT, IT_CPSL, IT_CPSR,
-              IT_KEEP, IT_GATK, IT_GPLACE, IT_CURSOR };
+              IT_KEEP, IT_GATK, IT_GPLACE, IT_CURSOR,
+              IT_HOTMASTER, IT_HOTLEFT, IT_HOTRIGHT, IT_HOTKEEP,
+              IT_HOTGATK, IT_HOTGPLACE, IT_HOTCURSOR };
 
 static const wchar_t* const kItemNames[ITEM_COUNT] = {
     L"总开关 (连点)",
@@ -220,13 +246,64 @@ static const wchar_t* const kItemNames[ITEM_COUNT] = {
     L"能攻击才点",
     L"能放置才点",
     L"视角内才点 (光标隐藏)",
+    L"总开关热键",
+    L"左键热键",
+    L"右键热键",
+    L"保持热键",
+    L"能攻击闸门热键",
+    L"能放置闸门热键",
+    L"视角闸门热键",
+};
+
+static const wchar_t* const kItemTips[ITEM_COUNT] = {
+    L"连点总开关；关闭后左右键都不连点",
+    L"开=按住左键连点；保持模式开启时无需按住",
+    L"开=按住右键连点；保持模式开启时无需按住",
+    L"左键每秒点击次数 (5~100)；按住左右拖动 / 滚轮 / ←→ 调整",
+    L"右键每秒点击次数 (5~100)；按住左右拖动 / 滚轮 / ←→ 调整",
+    L"开=无需按住鼠标持续连点；关=按住左/右键才点",
+    L"开=仅准星瞄准可攻击生物时才点左键",
+    L"开=仅手持放置物 (方块类) 时才点右键",
+    L"开=光标隐藏 (游戏视角) 时连点，光标可见 (背包/聊天) 时暂停",
+    L"回车后按下新按键绑定，Esc 取消；0=无",
+    L"回车后按下新按键绑定，Esc 取消；0=无",
+    L"回车后按下新按键绑定，Esc 取消；0=无",
+    L"回车后按下新按键绑定，Esc 取消；0=无",
+    L"回车后按下新按键绑定，Esc 取消；0=无",
+    L"回车后按下新按键绑定，Esc 取消；0=无",
+    L"回车后按下新按键绑定，Esc 取消；0=无",
 };
 
 static volatile LONG g_menuOpen = 0;
 static volatile LONG g_sel      = 0;
+static volatile LONG g_hover    = -1;    // 鼠标悬停项 (悬浮提示)
+static volatile LONG g_capturing = -1;   // 正在绑定热键的项
+static int   g_dragItem = -1;            // 正在滑动的 CPS 项
+static int   g_dragX = 0, g_dragVal = 0;
 static bool  g_prevInsert = false;
 static HWND  g_hwnd       = NULL;
 static WNDPROC g_origWndProc = NULL;
+
+// 分层悬浮窗 + 双缓存位图
+static HWND  g_ovl = NULL;
+static HDC   g_memDC = NULL;
+static HBITMAP g_dib = NULL;
+static void* g_bits = NULL;
+static LONG  g_bitsW = 0, g_bitsH = 0;
+static const char kOvlClass[] = "MCInGameOverlayW";
+static HINSTANCE g_hInst = NULL;
+
+// 色板 (CLR_BG/CLR_TIP 在 alpha 后处理中会被映射为半透明)
+static const COLORREF CLR_BG   = RGB(10, 11, 16);
+static const COLORREF CLR_TIP  = RGB(30, 32, 44);
+static const COLORREF CLR_SEL  = RGB(52, 64, 102);
+static const COLORREF CLR_SEP  = RGB(60, 70, 92);
+static const COLORREF CLR_TXT  = RGB(224, 228, 238);
+static const COLORREF CLR_DIM  = RGB(150, 160, 180);
+static const COLORREF CLR_ON   = RGB(96, 208, 140);
+static const COLORREF CLR_OFF  = RGB(240, 96, 110);
+static const COLORREF CLR_WHT  = RGB(255, 255, 255);
+static const COLORREF CLR_BRD  = RGB(110, 122, 150);
 
 // 点击状态 (渲染线程单线程访问)
 static bool  g_downL = false, g_downR = false;
@@ -235,6 +312,7 @@ static DWORD g_lastFrame = 0;
 
 static HFONT  g_fTitle = NULL, g_fRow = NULL, g_fDim = NULL;
 static HBRUSH g_brBg = NULL, g_brSel = NULL, g_brBorder = NULL, g_brSep = NULL;
+static HBRUSH g_brTip = NULL;
 
 static void ReleaseClick(bool left);   // 前向声明
 
@@ -242,6 +320,9 @@ static void OpenMenu(void)
 {
     g_menuOpen = 1;
     g_sel = 0;
+    g_hover = -1;
+    g_capturing = -1;
+    g_dragItem = -1;
     ReleaseClick(true);
     ReleaseClick(false);
     g_accL = g_accR = 0;
@@ -251,6 +332,8 @@ static void OpenMenu(void)
 static void CloseMenu(void)
 {
     g_menuOpen = 0;
+    g_capturing = -1;
+    g_dragItem = -1;
     SaveSettings();
     Log("menu close (saved)");
 }
@@ -263,15 +346,13 @@ static void ToggleItem(void)
     case IT_MASTER: g_s.master = !g_s.master; break;
     case IT_LEFT:   g_s.left   = !g_s.left;   break;
     case IT_RIGHT:  g_s.right  = !g_s.right;  break;
-    case IT_CPSL:   g_cpsIdxL  = (g_cpsIdxL + 1) % kCpsPresetCount;
-                    g_s.cpsLeft = kCpsPresets[g_cpsIdxL]; break;
-    case IT_CPSR:   g_cpsIdxR  = (g_cpsIdxR + 1) % kCpsPresetCount;
-                    g_s.cpsRight = kCpsPresets[g_cpsIdxR]; break;
+    case IT_CPSL:   g_s.cpsLeft  = clampCps(g_s.cpsLeft + 1); break;
+    case IT_CPSR:   g_s.cpsRight = clampCps(g_s.cpsRight + 1); break;
     case IT_KEEP:   g_s.keep   = !g_s.keep;   break;
     case IT_GATK:   g_s.gatk   = !g_s.gatk;   break;
     case IT_GPLACE: g_s.gplace = !g_s.gplace; break;
     case IT_CURSOR: g_s.gcursor = !g_s.gcursor; break;
-    default: break;
+    default: break;   // 热键项: 由回车进入绑定, 不在这里切换
     }
     if ((ItemId)(int)g_sel == IT_MASTER && !g_s.master) {
         ReleaseClick(true);
@@ -283,27 +364,125 @@ static void ToggleItem(void)
 
 static void AdjustItem(int dir)
 {
+    if (dir == 0) return;
     switch ((ItemId)(int)g_sel) {
-    case IT_CPSL: g_cpsIdxL = (g_cpsIdxL + dir + kCpsPresetCount) % kCpsPresetCount;
-                  g_s.cpsLeft = kCpsPresets[g_cpsIdxL]; break;
-    case IT_CPSR: g_cpsIdxR = (g_cpsIdxR + dir + kCpsPresetCount) % kCpsPresetCount;
-                  g_s.cpsRight = kCpsPresets[g_cpsIdxR]; break;
+    case IT_CPSL:   g_s.cpsLeft  = clampCps(g_s.cpsLeft + dir); break;
+    case IT_CPSR:   g_s.cpsRight = clampCps(g_s.cpsRight + dir); break;
+    case IT_HOTMASTER: case IT_HOTLEFT: case IT_HOTRIGHT: case IT_HOTKEEP:
+    case IT_HOTGATK: case IT_HOTGPLACE: case IT_HOTCURSOR:
+        g_capturing = g_sel;   // ←→ 也进入绑定
+        return;
     default: ToggleItem(); break;
     }
     ItemChanged();
 }
 
-// WndProc 子类化: 菜单打开时吃掉全部输入 (模态), 并处理菜单按键。
+//--------------------------------------------------------------------------
+// 热键: 指针 / 匹配 / 绑定 / 触发
+//--------------------------------------------------------------------------
+static int* HotkeyPtr(int item)
+{
+    switch (item) {
+    case IT_HOTMASTER:  return &g_s.hotMaster;
+    case IT_HOTLEFT:    return &g_s.hotLeft;
+    case IT_HOTRIGHT:   return &g_s.hotRight;
+    case IT_HOTKEEP:    return &g_s.hotKeep;
+    case IT_HOTGATK:    return &g_s.hotGatk;
+    case IT_HOTGPLACE:  return &g_s.hotGplace;
+    case IT_HOTCURSOR:  return &g_s.hotGcursor;
+    default: return NULL;
+    }
+}
+
+static int HotkeyOf(int item)
+{
+    int* p = HotkeyPtr(item);
+    return p ? *p : 0;
+}
+
+static void BindHotkey(int item, int vk)
+{
+    int* p = HotkeyPtr(item);
+    if (!p) return;
+    if (vk == VK_ESCAPE || vk == VK_INSERT) return;   // 菜单键不允许绑定
+    for (int i = IT_HOTMASTER; i <= IT_HOTCURSOR; ++i) {
+        int* q = HotkeyPtr(i);
+        if (q && q != p && *q == vk) *q = 0;          // 冲突解绑旧的
+    }
+    *p = vk;
+    ItemChanged();
+    Log("hotkey bound: item=%d vk=%d", item, vk);
+}
+
+static bool HotkeyVkMatch(int vk)
+{
+    if (!vk) return false;
+    for (int i = IT_HOTMASTER; i <= IT_HOTCURSOR; ++i)
+        if (HotkeyOf(i) == vk) return true;
+    return false;
+}
+
+static void DoHotkey(int vk)
+{
+    for (int i = IT_HOTMASTER; i <= IT_HOTCURSOR; ++i) {
+        if (HotkeyOf(i) != vk) continue;
+        switch (i) {
+        case IT_HOTMASTER: g_s.master = !g_s.master; break;
+        case IT_HOTLEFT:   g_s.left   = !g_s.left;   break;
+        case IT_HOTRIGHT:  g_s.right  = !g_s.right;  break;
+        case IT_HOTKEEP:   g_s.keep   = !g_s.keep;   break;
+        case IT_HOTGATK:   g_s.gatk   = !g_s.gatk;   break;
+        case IT_HOTGPLACE: g_s.gplace = !g_s.gplace; break;
+        case IT_HOTCURSOR: g_s.gcursor = !g_s.gcursor; break;
+        default: return;
+        }
+        if (i == IT_HOTMASTER && !g_s.master) {
+            ReleaseClick(true);
+            ReleaseClick(false);
+            g_accL = g_accR = 0;
+        }
+        ItemChanged();
+        Log("hotkey vk=%d -> item=%d", vk, i);
+        return;
+    }
+}
+
+// 游戏窗口子类化: 菜单打开时处理菜单按键/热键绑定/点击空白快关;
+// 菜单关闭时拦截已绑定热键并吃掉该键。
 static LRESULT CALLBACK MenuWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
-    if (!g_menuOpen)
+    // ---- 菜单关闭: 热键拦截 ----
+    if (!g_menuOpen) {
+        if (msg == WM_KEYDOWN && !((lp >> 30) & 1) && (UINT)wp != VK_INSERT) {
+            if (HotkeyVkMatch((UINT)wp)) { DoHotkey((UINT)wp); return 0; }
+        }
+        if (msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN) {
+            int vk = (msg == WM_MBUTTONDOWN) ? VK_MBUTTON
+                   : ((HIWORD(wp) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2);
+            if (HotkeyVkMatch(vk)) { DoHotkey(vk); return 0; }
+        }
         return g_origWndProc ? CallWindowProcW(g_origWndProc, h, msg, wp, lp)
                              : DefWindowProcW(h, msg, wp, lp);
+    }
 
+    // ---- 菜单打开: 模态 ----
     switch (msg) {
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN: {
-        switch ((UINT)wp) {
+        UINT vk = (UINT)wp;
+        bool rep = ((lp >> 30) & 1) != 0;
+        if (g_capturing >= 0) {                       // 热键绑定中
+            if (vk == VK_ESCAPE) g_capturing = -1;    // 取消
+            else { BindHotkey((int)g_capturing, vk); g_capturing = -1; }
+            return 0;
+        }
+        if (rep) {
+            // 按住自动重复: 仅 CPS 项连续滑动, 布尔项忽略防误触
+            if (g_sel == IT_CPSL || g_sel == IT_CPSR)
+                AdjustItem(vk == VK_LEFT ? -1 : (vk == VK_RIGHT ? 1 : 0));
+            return 0;
+        }
+        switch (vk) {
         case VK_INSERT: g_prevInsert = true; CloseMenu(); break; // 抑制钩子轮询的同一击
         case VK_ESCAPE: CloseMenu(); break;
         case VK_UP:     g_sel = (g_sel + ITEM_COUNT - 1) % ITEM_COUNT; break;
@@ -311,7 +490,10 @@ static LRESULT CALLBACK MenuWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         case VK_LEFT:   AdjustItem(-1); break;
         case VK_RIGHT:  AdjustItem(+1); break;
         case VK_RETURN:
-        case VK_SPACE:  ToggleItem(); break;
+        case VK_SPACE:
+            if (g_sel >= IT_HOTMASTER && g_sel <= IT_HOTCURSOR) g_capturing = g_sel;
+            else ToggleItem();
+            break;
         default: break;
         }
         return 0;
@@ -319,25 +501,14 @@ static LRESULT CALLBACK MenuWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_KEYUP: case WM_SYSKEYUP:
     case WM_CHAR: case WM_SYSCHAR: case WM_DEADCHAR:
         return 0;
-    case WM_LBUTTONDOWN: {
-        POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
-        if (pt.x >= MENU_X && pt.x <= MENU_X + MENU_W &&
-            pt.y >= ITEM_TOP && pt.y < ITEM_TOP + ITEM_COUNT * ROW_H) {
-            g_sel = (pt.y - ITEM_TOP) / ROW_H;
-            ToggleItem();
-        }
+    case WM_LBUTTONDOWN:        // 点在菜单面板外 -> 快速关闭
+        CloseMenu();
         return 0;
-    }
     case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
     case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
     case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
     case WM_XBUTTONDOWN: case WM_XBUTTONUP:
-        return 0;
-    case WM_MOUSEWHEEL: {
-        int d = (short)HIWORD(wp);
-        g_sel = (g_sel + ITEM_COUNT + (d > 0 ? -1 : 1)) % ITEM_COUNT;
-        return 0;
-    }
+    case WM_MOUSEWHEEL:
     case WM_MOUSEMOVE:
         return 0;
     default:
@@ -352,6 +523,18 @@ static void PollInsertKey(void)
     bool cur = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
     if (!g_menuOpen && cur && !g_prevInsert) OpenMenu();
     g_prevInsert = cur;
+}
+
+// 外部命令 (injector -menu) 通过命名事件触发打开菜单; 帧内轮询, 无线程
+static HANDLE g_menuEvent = NULL;
+
+static void PollMenuEvent(void)
+{
+    if (!g_menuEvent) return;
+    if (WaitForSingleObject(g_menuEvent, 0) == WAIT_OBJECT_0) {
+        ResetEvent(g_menuEvent);
+        if (!g_menuOpen) OpenMenu();
+    }
 }
 
 // 首帧从 DC 反查游戏窗口并安装 WndProc 子类
@@ -381,10 +564,11 @@ static void EnsureUiObjects(void)
         g_fDim = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
-    if (!g_brBg)     g_brBg     = CreateSolidBrush(RGB(14, 16, 24));
-    if (!g_brSel)    g_brSel    = CreateSolidBrush(RGB(46, 58, 92));
-    if (!g_brBorder) g_brBorder = CreateSolidBrush(RGB(110, 122, 150));
-    if (!g_brSep)    g_brSep    = CreateSolidBrush(RGB(60, 70, 92));
+    if (!g_brBg)     g_brBg     = CreateSolidBrush(CLR_BG);
+    if (!g_brSel)    g_brSel    = CreateSolidBrush(CLR_SEL);
+    if (!g_brBorder) g_brBorder = CreateSolidBrush(CLR_BRD);
+    if (!g_brSep)    g_brSep    = CreateSolidBrush(CLR_SEP);
+    if (!g_brTip)    g_brTip    = CreateSolidBrush(CLR_TIP);
 }
 
 static void AtoW(const char* s, wchar_t* out, int cap)
@@ -393,6 +577,38 @@ static void AtoW(const char* s, wchar_t* out, int cap)
     if (!s) { out[0] = 0; return; }
     MultiByteToWideChar(CP_ACP, 0, s, -1, out, cap - 1);
     out[cap - 1] = 0;
+}
+
+static void VkNameW(int vk, wchar_t* out, int cap)
+{
+    switch (vk) {
+    case 0:            swprintf(out, cap, L"无"); return;
+    case VK_LBUTTON:   swprintf(out, cap, L"鼠标左键"); return;
+    case VK_RBUTTON:   swprintf(out, cap, L"鼠标右键"); return;
+    case VK_MBUTTON:   swprintf(out, cap, L"鼠标中键"); return;
+    case VK_XBUTTON1:  swprintf(out, cap, L"侧键1"); return;
+    case VK_XBUTTON2:  swprintf(out, cap, L"侧键2"); return;
+    default: break;
+    }
+    UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    switch (vk) {
+    case VK_LEFT: case VK_UP: case VK_RIGHT: case VK_DOWN:
+    case VK_RCONTROL: case VK_RMENU:
+    case VK_LWIN: case VK_RWIN: case VK_APPS:
+    case VK_INSERT: case VK_HOME: case VK_PRIOR:
+    case VK_DELETE: case VK_END: case VK_NEXT:
+    case VK_NUMLOCK: case VK_SCROLL:
+        scan |= 0x100;   // 扩展键位 (lParam bit24)
+        break;
+    default: break;
+    }
+    wchar_t buf[64];
+    if (scan && GetKeyNameTextW(scan << 16, buf, 64) > 0) {
+        wcsncpy(out, buf, cap - 1);
+        out[cap - 1] = 0;
+        return;
+    }
+    swprintf(out, cap, L"键%d", vk);
 }
 
 static int ItemBool(int i)
@@ -409,29 +625,169 @@ static int ItemBool(int i)
     }
 }
 
-// 每次 SwapBuffers 后绘制 (绘制在已呈现的前缓冲上, 下一帧被覆盖前重绘)
-static void DrawMenu(HDC hdc)
+//--------------------------------------------------------------------------
+// 分层悬浮窗 + 内存 DC 双缓存合成 (真正的双缓冲, 不闪)
+//--------------------------------------------------------------------------
+static int HitItem(int x, int y)
 {
-    (void)hdc;
-    if (!g_menuOpen || !g_hwnd || IsIconic(g_hwnd)) return;
-    HDC dc = GetDC(g_hwnd);
-    if (!dc) return;
+    if (x < 0 || x >= MENU_W) return -1;
+    if (y < ITEM_TOP || y >= ITEM_TOP + ITEM_COUNT * ROW_H) return -1;
+    return (y - ITEM_TOP) / ROW_H;
+}
+
+// 悬浮窗消息处理: 点击/拖动滑 CPS/滚轮/悬停
+static LRESULT CALLBACK OverlayProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_LBUTTONDOWN: {
+        if (!g_menuOpen) break;
+        POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
+        int item = HitItem(pt.x, pt.y);
+        if (item >= 0) {
+            g_sel = item;
+            if (item == IT_CPSL || item == IT_CPSR) {
+                g_dragItem = item;
+                g_dragX = pt.x;
+                g_dragVal = (item == IT_CPSL) ? g_s.cpsLeft : g_s.cpsRight;
+                SetCapture(h);
+            } else if (item >= IT_HOTMASTER && item <= IT_HOTCURSOR) {
+                g_capturing = item;
+            } else {
+                ToggleItem();
+            }
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (!g_menuOpen) break;
+        POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
+        g_hover = HitItem(pt.x, pt.y);
+        if (g_dragItem >= 0) {                    // 滑动调 CPS: 每 2px = 1 CPS
+            int v = clampCps(g_dragVal + (pt.x - g_dragX) / 2);
+            if (g_dragItem == IT_CPSL) {
+                if (g_s.cpsLeft != v) { g_s.cpsLeft = v; ItemChanged(); }
+            } else {
+                if (g_s.cpsRight != v) { g_s.cpsRight = v; ItemChanged(); }
+            }
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP:
+        if (g_dragItem >= 0) { g_dragItem = -1; ReleaseCapture(); }
+        return 0;
+    case WM_MOUSEWHEEL: {
+        if (!g_menuOpen) break;
+        int d = (short)HIWORD(wp);
+        if (g_hover == IT_CPSL) {
+            g_s.cpsLeft = clampCps(g_s.cpsLeft + (d > 0 ? 1 : -1));
+            ItemChanged();
+        } else if (g_hover == IT_CPSR) {
+            g_s.cpsRight = clampCps(g_s.cpsRight + (d > 0 ? 1 : -1));
+            ItemChanged();
+        } else {
+            g_sel = (g_sel + ITEM_COUNT + (d > 0 ? -1 : 1)) % ITEM_COUNT;
+        }
+        return 0;
+    }
+    default: break;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static bool EnsureOverlay(void)
+{
+    if (g_ovl) return true;
+    HINSTANCE inst = g_hInst ? g_hInst : GetModuleHandleA(NULL);
+    WNDCLASSEXA wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = OverlayProc;
+    wc.hInstance = inst;
+    wc.lpszClassName = kOvlClass;
+    wc.hCursor = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
+    RegisterClassExA(&wc);   // 重复注册返回失败, 忽略
+    g_ovl = CreateWindowExA(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kOvlClass, "MCInGame", WS_POPUP,
+        0, 0, OVL_W, OVL_H, NULL, NULL, inst, NULL);
+    if (g_ovl) Log("overlay window created");
+    return g_ovl != NULL;
+}
+
+static bool EnsureBackbuffer(void)
+{
+    if (g_memDC) return true;
+    HDC screen = GetDC(NULL);
+    g_memDC = CreateCompatibleDC(screen);
+    ReleaseDC(NULL, screen);
+    if (!g_memDC) return false;
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = OVL_W;
+    bi.bmiHeader.biHeight = -OVL_H;          // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    g_dib = CreateDIBSection(g_memDC, &bi, DIB_RGB_COLORS, &g_bits, NULL, 0);
+    if (!g_dib) {
+        DeleteDC(g_memDC);
+        g_memDC = NULL;
+        return false;
+    }
+    SelectObject(g_memDC, g_dib);
+    g_bitsW = OVL_W;
+    g_bitsH = OVL_H;
+    return true;
+}
+
+// GDI 写 DIB 时 alpha 通道固定为 0; 后处理: 背景/提示底色映射为半透明
+// (预乘 alpha), 其余内容 (文字/选中条/边框) 置为不透明。
+static void ApplyAlpha(void)
+{
+    BYTE* p = (BYTE*)g_bits;
+    for (LONG y = 0; y < g_bitsH; ++y) {
+        BYTE* row = p + (size_t)y * g_bitsW * 4;
+        for (LONG x = 0; x < g_bitsW; ++x) {
+            BYTE* px = row + (size_t)x * 4;
+            if (px[3] != 0) continue;    // 已是透明区
+            COLORREF c = RGB(px[2], px[1], px[0]);
+            if (c == CLR_BG) {
+                px[0] = px[0] * 210 / 255;
+                px[1] = px[1] * 210 / 255;
+                px[2] = px[2] * 210 / 255;
+                px[3] = 210;
+            } else if (c == CLR_TIP) {
+                px[0] = px[0] * 205 / 255;
+                px[1] = px[1] * 205 / 255;
+                px[2] = px[2] * 205 / 255;
+                px[3] = 205;
+            } else {
+                px[3] = 255;
+            }
+        }
+    }
+}
+
+static void ComposeFrame(void)
+{
+    if (!EnsureBackbuffer()) return;
+    memset(g_bits, 0, (size_t)g_bitsW * 4 * g_bitsH);   // 全透明
+    HDC dc = g_memDC;
     EnsureUiObjects();
 
-    RECT panel = { MENU_X, MENU_Y, MENU_X + MENU_W, MENU_Y + MENU_H };
+    RECT panel = { 0, 0, MENU_W, MENU_H };
     FillRect(dc, &panel, g_brBg);
     FrameRect(dc, &panel, g_brBorder);
     SetBkMode(dc, TRANSPARENT);
 
     // 标题
     SelectObject(dc, g_fTitle);
-    SetTextColor(dc, RGB(255, 255, 255));
-    RECT rt = { MENU_X + 12, MENU_Y, MENU_X + MENU_W - 12, MENU_Y + TITLE_H };
-    DrawTextW(dc, L"MCInGame 连点器  v1.0", -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    SetTextColor(dc, CLR_WHT);
+    RECT rt = { 12, 0, MENU_W - 12, TITLE_H };
+    DrawTextW(dc, L"MCInGame 连点器  v1.1", -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     // 状态行
     SelectObject(dc, g_fDim);
-    SetTextColor(dc, RGB(150, 160, 180));
+    SetTextColor(dc, CLR_DIM);
     wchar_t st[256];
     if (g_status->ready) {
         wchar_t map[40], ver[32];
@@ -444,12 +800,12 @@ static void DrawMenu(HDC hdc)
         AtoW(g_status->errMsg, err, 96);
         swprintf(st, 256, L"状态: 解析中… (%ls)", g_status->errMsg[0] ? err : L"-");
     }
-    RECT r1 = { MENU_X + 12, MENU_Y + TITLE_H, MENU_X + MENU_W - 12, MENU_Y + TITLE_H + INFO_H };
+    RECT r1 = { 12, TITLE_H, MENU_W - 12, TITLE_H + INFO_H };
     DrawTextW(dc, st, -1, &r1, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     // 实时状态行
     SelectObject(dc, g_fRow);
-    SetTextColor(dc, RGB(224, 228, 238));
+    SetTextColor(dc, CLR_TXT);
     const wchar_t* atk  = g_status->canAttack ? L"是" : L"否";
     const wchar_t* held = !g_status->inGame ? L"—"
                         : (g_status->heldItemNull ? L"空"
@@ -457,60 +813,93 @@ static void DrawMenu(HDC hdc)
     wchar_t live[128];
     swprintf(live, 128, L"能攻击:%ls  手持:%ls  左:%ls 右:%ls",
              atk, held, g_downL ? L"●" : L"○", g_downR ? L"●" : L"○");
-    RECT r2 = { MENU_X + 12, MENU_Y + TITLE_H + INFO_H, MENU_X + MENU_W - 12, MENU_Y + TITLE_H + INFO_H * 2 };
+    RECT r2 = { 12, TITLE_H + INFO_H, MENU_W - 12, TITLE_H + INFO_H * 2 };
     DrawTextW(dc, live, -1, &r2, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     // 分隔线
-    RECT sep1 = { MENU_X + 6, MENU_Y + TITLE_H + INFO_H * 2 + 2,
-                  MENU_X + MENU_W - 6, MENU_Y + TITLE_H + INFO_H * 2 + 3 };
+    RECT sep1 = { 6, TITLE_H + INFO_H * 2 + 2, MENU_W - 6, TITLE_H + INFO_H * 2 + 3 };
     FillRect(dc, &sep1, g_brSep);
 
     // 菜单项
     for (int i = 0; i < ITEM_COUNT; ++i) {
-        RECT rr = { MENU_X + 6, ITEM_TOP + i * ROW_H,
-                    MENU_X + MENU_W - 6, ITEM_TOP + (i + 1) * ROW_H };
+        RECT rr = { 6, ITEM_TOP + i * ROW_H, MENU_W - 6, ITEM_TOP + (i + 1) * ROW_H };
         if (i == g_sel) FillRect(dc, &rr, g_brSel);
         SelectObject(dc, g_fRow);
-        SetTextColor(dc, RGB(224, 228, 238));
-        RECT rn = { rr.left + 8, rr.top, rr.right - 78, rr.bottom };
+        SetTextColor(dc, CLR_TXT);
+        RECT rn = { rr.left + 8, rr.top, rr.right - 84, rr.bottom };
         DrawTextW(dc, kItemNames[i], -1, &rn, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        RECT rv = { rr.right - 74, rr.top, rr.right - 6, rr.bottom };
-        wchar_t val[32];
-        if (i == IT_CPSL) {
-            swprintf(val, 32, L"%d/s", g_s.cpsLeft);
-            SetTextColor(dc, RGB(255, 255, 255));
+        RECT rv = { rr.right - 80, rr.top, rr.right - 6, rr.bottom };
+        wchar_t val[40];
+        if (i == g_capturing) {
+            wcscpy(val, L"按新键…");
+            SetTextColor(dc, CLR_ON);
+        } else if (i == IT_CPSL) {
+            swprintf(val, 40, L"%d/s", g_s.cpsLeft);
+            SetTextColor(dc, CLR_WHT);
         } else if (i == IT_CPSR) {
-            swprintf(val, 32, L"%d/s", g_s.cpsRight);
-            SetTextColor(dc, RGB(255, 255, 255));
+            swprintf(val, 40, L"%d/s", g_s.cpsRight);
+            SetTextColor(dc, CLR_WHT);
+        } else if (i >= IT_HOTMASTER && i <= IT_HOTCURSOR) {
+            VkNameW(HotkeyOf(i), val, 40);
+            SetTextColor(dc, CLR_WHT);
         } else if (ItemBool(i)) {
             wcscpy(val, L"开");
-            SetTextColor(dc, RGB(96, 208, 140));
+            SetTextColor(dc, CLR_ON);
         } else {
             wcscpy(val, L"关");
-            SetTextColor(dc, RGB(240, 96, 110));
+            SetTextColor(dc, CLR_OFF);
         }
         DrawTextW(dc, val, -1, &rv, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
 
     // 分隔线
-    RECT sep2 = { MENU_X + 6, ITEM_TOP + ITEM_COUNT * ROW_H + 2,
-                  MENU_X + MENU_W - 6, ITEM_TOP + ITEM_COUNT * ROW_H + 3 };
+    RECT sep2 = { 6, ITEM_TOP + ITEM_COUNT * ROW_H + 2, MENU_W - 6, ITEM_TOP + ITEM_COUNT * ROW_H + 3 };
     FillRect(dc, &sep2, g_brSep);
 
     // 底部提示
     SelectObject(dc, g_fDim);
-    SetTextColor(dc, RGB(150, 160, 180));
-    RECT rf1 = { MENU_X + 12, ITEM_TOP + ITEM_COUNT * ROW_H + 6,
-                 MENU_X + MENU_W - 12, ITEM_TOP + ITEM_COUNT * ROW_H + 22 };
-    DrawTextW(dc, L"Insert/Esc 关闭 · ↑↓ 选择 · ←→/回车 调整", -1, &rf1,
+    SetTextColor(dc, CLR_DIM);
+    RECT rf1 = { 12, ITEM_TOP + ITEM_COUNT * ROW_H + 6, MENU_W - 12, ITEM_TOP + ITEM_COUNT * ROW_H + 22 };
+    DrawTextW(dc, L"Insert/Esc 或点菜单外关闭 · ↑↓ 选择 · ←→/回车 调整", -1, &rf1,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    RECT rf2 = { MENU_X + 12, ITEM_TOP + ITEM_COUNT * ROW_H + 22,
-                 MENU_X + MENU_W - 12, ITEM_TOP + ITEM_COUNT * ROW_H + 38 };
-    DrawTextW(dc, L"设置自动保存 · 无网络 / 无共享内存 / 无线程", -1, &rf2,
+    RECT rf2 = { 12, ITEM_TOP + ITEM_COUNT * ROW_H + 22, MENU_W - 12, ITEM_TOP + ITEM_COUNT * ROW_H + 38 };
+    DrawTextW(dc, L"拖动/滚轮滑 CPS · 热键项回车绑定 · 设置自动保存", -1, &rf2,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    ReleaseDC(g_hwnd, dc);
+    // 悬浮提示 (鼠标悬停时, 显示在面板右侧)
+    if (g_hover >= 0 && g_hover < ITEM_COUNT) {
+        int ty = ITEM_TOP + g_hover * ROW_H;
+        if (ty + 46 > MENU_H) ty = MENU_H - 48;
+        RECT tr = { MENU_W + 8, ty, OVL_W - 8, ty + 46 };
+        FillRect(dc, &tr, g_brTip);
+        FrameRect(dc, &tr, g_brBorder);
+        SetTextColor(dc, CLR_TXT);
+        RECT tt = { tr.left + 6, tr.top + 3, tr.right - 6, tr.bottom - 3 };
+        DrawTextW(dc, kItemTips[g_hover], -1, &tt,
+                  DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
+    }
+
+    ApplyAlpha();
+}
+
+// 每帧: 菜单打开 -> 定位悬浮窗 + 合成 + 一次 UpdateLayeredWindow (原子呈现)
+static void UpdateOverlay(void)
+{
+    if (!g_menuOpen || !g_hwnd || IsIconic(g_hwnd)) {
+        if (g_ovl && IsWindowVisible(g_ovl)) ShowWindow(g_ovl, SW_HIDE);
+        return;
+    }
+    if (!EnsureOverlay() || !EnsureBackbuffer()) return;
+    POINT tl = { 10, 10 };
+    ClientToScreen(g_hwnd, &tl);
+    SetWindowPos(g_ovl, HWND_TOPMOST, tl.x, tl.y, OVL_W, OVL_H,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    ComposeFrame();
+    BLENDFUNCTION bf = { AC_SRC_ALPHA, 0, 255, 0 };
+    POINT src = { 0, 0 };
+    SIZE sz = { OVL_W, OVL_H };
+    UpdateLayeredWindow(g_ovl, NULL, NULL, &sz, g_memDC, &src, 0, &bf, ULW_ALPHA);
 }
 
 //--------------------------------------------------------------------------
@@ -1867,6 +2256,7 @@ static BOOL WINAPI HookSwapBuffers(HDC hdc)
     }
 
     PollInsertKey();
+    PollMenuEvent();
 
     if (!g_vm) {
         HMODULE jvm = GetModuleHandleA("jvm.dll");
@@ -1905,7 +2295,7 @@ static BOOL WINAPI HookSwapBuffers(HDC hdc)
 
     BOOL r = g_origSwapBuffers ? g_origSwapBuffers(hdc) : FALSE;
 
-    DrawMenu(hdc);
+    UpdateOverlay();
     return r;
 }
 
@@ -2012,6 +2402,16 @@ __declspec(dllexport) BOOL WINAPI GetStatus(Status* out)
     return TRUE;
 }
 
+// 调试/自动化测试: 触发打开菜单 (injector -menu 通过命名事件调用)
+__declspec(dllexport) void WINAPI DbgOpenMenu(void)
+{
+    HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Local\\MCInGameMenuEvent");
+    if (ev) {
+        SetEvent(ev);
+        CloseHandle(ev);
+    }
+}
+
 } // extern "C"
 
 //--------------------------------------------------------------------------
@@ -2025,11 +2425,15 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hInst);
         if (InterlockedExchange(&g_attached, 1)) return TRUE; // 防重复 LoadLibrary 二次初始化
+        g_hInst = hInst;
 
         // 单实例守卫: 同名互斥体已存在说明本进程已注入过
         HANDLE mut = CreateMutexA(NULL, FALSE, "Local\\MCInGameClicker");
         if (mut && GetLastError() == ERROR_ALREADY_EXISTS) return TRUE;
         g_guardMutex = mut;
+
+        // 外部菜单命令事件 (injector -menu)
+        g_menuEvent = CreateEventA(NULL, TRUE, FALSE, "Local\\MCInGameMenuEvent");
 
         // 与参考实现一致: 从 PEB 模块链表摘除自身 (模块枚举不可见)
         HideModuleFromPeb(hInst);
@@ -2057,6 +2461,9 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         if (g_hwnd && g_origWndProc && IsWindow(g_hwnd)) {
             SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
         }
+        if (g_ovl && IsWindow(g_ovl)) DestroyWindow(g_ovl);
+        if (g_memDC) DeleteDC(g_memDC);
+        if (g_menuEvent) { CloseHandle(g_menuEvent); g_menuEvent = NULL; }
         if (g_guardMutex) { CloseHandle(g_guardMutex); g_guardMutex = NULL; }
         // 钩子有意不还原: DLL 与进程同生命周期, 退出阶段还原补丁
         // 会与其他仍在执行的线程竞态, 无意义且有崩溃风险。
