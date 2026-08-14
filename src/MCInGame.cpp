@@ -1,38 +1,23 @@
 //============================================================================
-//  MCInGame.dll  (v1.3)
+//  MCInGame.dll  (v1.4)
 //  注入到 Minecraft (java/javaw) 进程中的游戏内连点器。
 //
-//  v1.3: CPS 支持一位小数 (0.5~50.0, 0.1 步进; 内部以 0.1 单位存储,
-//        与原连点器一致), 点击间隔按 10000/cps10 毫秒精确计算。
+//  本文件 = 原项目 src/MCCombatStatusJni.cpp (V65.1, 与参考实现对齐版)
+//  直接删减增补而来, 不是重写:
+//    * 注入机制与原项目逐行一致: gdi32!SwapBuffers 12 字节导出存根
+//      绝对跳转补丁、PEB 三链表摘链、DllMain 顺序、帧内 GetEnv 复用
+//      JNIEnv 的整套状态机 (类加载器探测/171 张映射表/分帧解析) 均未改动。
+//    * 删减: 共享内存 (Local\MCCombatStatus_<pid>) 对外发布 —— 状态改为
+//      进程内 CombatStatus 实例 (指针用法不变); UDP 早在 V65.1 已移除。
+//      防重复注入由原项目的共享内存健康检查改为"检测存根是否已被补丁",
+//      不创建任何新的命名内核对象。
+//    * 增补 (文件尾部与钩子尾部): 游戏内菜单 (Insert, 分层悬浮窗双缓存),
+//      连点逻辑, 快捷键与 Toast, 设置 INI。
 //
-//  v1.2 菜单 (按原连点器 v2.9 的 UI 设计重做):
-//    * 独立分层悬浮窗 + 内存 DC 双缓存合成 (UpdateLayeredWindow, 不闪烁)
-//    * 玻璃开关 / 可见滑块条 (轨道+填充+拇指) / 档位块 10·20·30·40
-//    * CPS 5~50 连续可调 (拖动/点轨道/滚轮/←→ 按住连滑)
-//    * 7 个可自定义快捷键 (回车/←→/点击进入绑定, 支持鼠标侧键, 有 Toast 反馈)
-//    * 悬浮提示 + 点击菜单外快速关闭
-//
-//  与旧项目 (MCCombatStatusJni) 的区别 (按需求对齐参考实现):
-//    * 不再通过共享内存/UDP 对外发布状态 —— 交互全部发生在游戏内:
-//      按 Insert 呼出游戏内菜单 (GDI 叠加层), 菜单里直接开关连点、
-//      调 CPS、开关闸门, 设置自动保存到 %APPDATA%\MCInGameClicker\settings.ini。
-//    * 连点逻辑也移入游戏进程: 渲染帧内按时间累加器精确发 click
-//      (PostMessage WM_LBUTTONDOWN/UP, 与外部版 AutoClicker v2.9 同协议),
-//      不再需要任何外部程序。
-//    * 删除滚轮点 (scroll-to-click) 与多倍点 (multi-click)。
-//    * 保留: 左/右键独立开关与 CPS、保持连点(无需按住)、三个闸门
-//      (能攻击才点 / 能放置才点 / 视角内才点-光标隐藏)。
-//
-//  架构 (与参考实现一致, V65.1 对齐版):
-//    * 不创建任何线程、不 AttachCurrentThread、不创建任何 socket。
-//    * 内联钩住 gdi32!SwapBuffers: 覆盖 12 字节导出存根为绝对跳转
-//      (mov rax,imm64; jmp rax), 真实函数从存根槽位读出。
-//    * 钩子内 GetEnv() 复用渲染线程已有的 JNIEnv 解析 MC 状态
-//      (能攻击/手持放置物/是否在游戏内), 全部工作在渲染帧内分帧完成。
-//    * DllMain 内把本 DLL 从 PEB 模块三链表摘除 (模块枚举不可见)。
-//
-//  版本适配: mc_maps_generated.h (171 张映射表, 1.8.9~1.21.x,
-//  vanilla/forge/mojang/intermediary), 自动探测运行环境并逐表尝试。
+//  版本历史:
+//    v1.1 分层悬浮窗双缓存菜单; v1.2 按原连点器 v2.9 UI 重做
+//    (可见滑块/档位块/玻璃开关/热键绑定/悬浮提示); v1.3 CPS 一位小数;
+//    v1.4 注入机制代码逐行恢复原项目。
 //============================================================================
 
 #define WIN32_LEAN_AND_MEAN
@@ -50,7 +35,7 @@
 // 内部状态结构 (不再跨进程发布; 仅本进程内使用, 菜单/连点逻辑读取)
 //--------------------------------------------------------------------------
 #pragma pack(push, 1)
-struct Status {
+struct CombatStatus {
     DWORD        magic;            // 0x4D434354 = 'MCST'
     DWORD        version;          // 7
     volatile LONG ready;           // JNI 解析是否成功
@@ -79,8 +64,8 @@ struct Status {
 static const DWORD kMagic   = 0x4D435354; // 'MCST'
 static const DWORD kVersion = 7;
 
-static Status  g_st;
-#define g_status (&g_st)
+static CombatStatus g_statusBuf;
+static CombatStatus* g_status = &g_statusBuf;
 
 static char g_gameVer[32];   // 从 classpath 提取的 MC 版本号 (菜单显示)
 
@@ -986,7 +971,7 @@ static void ComposeFrame(void)
     SelectObject(dc, g_fTitle);
     SetTextColor(dc, CLR_WHT);
     RECT rt = { 12, 0, MENU_W - 12, TITLE_H };
-    DrawTextW(dc, L"MCInGame 连点器  v1.3", -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextW(dc, L"MCInGame 连点器  v1.4", -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     RECT rl = { 12, TITLE_H - 1, MENU_W - 12, TITLE_H };
     FillRect(dc, &rl, g_brAcc);
 
@@ -1281,7 +1266,7 @@ static void ClickTick(HDC hdc)
 //--------------------------------------------------------------------------
 static void AppendFail(const char* s)
 {
-    if (!s) return;
+    if (!g_status || !s) return;
     size_t n = strlen(g_status->failLog);
     size_t m = strlen(s);
     if (n + m + 2 >= sizeof(g_status->failLog)) return;
@@ -1340,6 +1325,7 @@ static jclass FindLoadedClassByName(JNIEnv* env, jobject loader, const char* sla
     jmethodID flc = env->GetMethodID(loaderCls, "findLoadedClass",
                                      "(Ljava/lang/String;)Ljava/lang/Class;");
     if (!flc) { env->ExceptionClear(); return NULL; }
+    // 斜杠名转点分名
     char dot[256];
     size_t n = strlen(slashName);
     if (n >= sizeof(dot)) n = sizeof(dot) - 1;
@@ -1350,7 +1336,7 @@ static jclass FindLoadedClassByName(JNIEnv* env, jobject loader, const char* sla
     jclass c = (jclass)env->CallObjectMethod(loader, flc, nm);
     if (env->ExceptionCheck()) { env->ExceptionClear(); }
     env->DeleteLocalRef(nm);
-    return c;
+    return c; // 可能为 NULL (未加载)
 }
 
 static jclass LoadClass(JNIEnv* env, const char* slashName, jobject loader,
@@ -1424,18 +1410,18 @@ static jobject FindLaunchClassLoader(JNIEnv* env, jclass clsCls, jmethodID forNa
     (void)env; (void)clsCls; (void)forName;
     return NULL;
 #else
-    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "L1:find-Launch");
+    if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "L1:find-Launch");
     jclass launch = env->FindClass("net/minecraft/launchwrapper/Launch");
     if (!launch) { env->ExceptionClear(); return NULL; }
-    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "L2:Launch-ok");
+    if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "L2:Launch-ok");
     jfieldID cl = env->GetStaticFieldID(launch, "classLoader", "Lnet/minecraft/launchwrapper/LaunchClassLoader;");
     if (!cl) { env->ExceptionClear(); return NULL; }
-    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "L3:field-ok");
+    if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "L3:field-ok");
     jobject loader = env->GetStaticObjectField(launch, cl);
     if (env->ExceptionCheck()) env->ExceptionClear();
-    CopyName(g_status->errMsg, sizeof(g_status->errMsg),
+    if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg),
              loader ? "L4:loader-ok" : "L4:loader-null");
-    return loader;
+    return loader; // 可能为 NULL (未设置)
 #endif
 }
 
@@ -1445,17 +1431,17 @@ static jobject FindThreadClassLoader(JNIEnv* env, jclass clsCls, jmethodID forNa
     (void)env; (void)clsCls; (void)forName;
     return NULL;
 #else
-    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T0:start");
+    if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T0:start");
     jclass threadCls = env->FindClass("java/lang/Thread");
     if (!threadCls) { env->ExceptionClear(); return NULL; }
-    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T1:threadCls");
+    if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T1:threadCls");
     jmethodID getAll = env->GetStaticMethodID(threadCls, "getAllStackTraces",
                                               "()Ljava/util/Map;");
     if (!getAll) { env->ExceptionClear(); return NULL; }
-    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T2:getAll");
+    if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T2:getAll");
     jobject map = env->CallStaticObjectMethod(threadCls, getAll);
     if (env->ExceptionCheck() || !map) { env->ExceptionClear(); return NULL; }
-    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T3:map");
+    if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T3:map");
 
     jclass mapCls = env->FindClass("java/util/Map");
     jclass setCls = env->FindClass("java/util/Set");
@@ -1473,35 +1459,41 @@ static jobject FindThreadClassLoader(JNIEnv* env, jclass clsCls, jmethodID forNa
     }
 
     jobject set = env->CallObjectMethod(map, keySet);
-    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T4:keySet");
+    if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T4:keySet");
     jobject it  = env->CallObjectMethod(set, iterator);
-    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T5:iterator");
+    if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T5:iterator");
     if (env->ExceptionCheck() || !it) { env->ExceptionClear(); return NULL; }
 
     DWORD tStart = GetTickCount();
     jobject found = NULL;
-    jobject found2 = NULL;
+    jobject found2 = NULL; // 后备 loader (只能加载混淆名等非标准类)
     while (env->CallBooleanMethod(it, hasNext)) {
-        if (GetTickCount() - tStart > 10000) break;
-        CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T6:hasNext");
+        if (GetTickCount() - tStart > 10000) break; // 10 秒超时保护
+        if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T6:hasNext");
         if (env->ExceptionCheck()) { env->ExceptionClear(); break; }
         jobject thread = env->CallObjectMethod(it, next);
-        CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T7:next");
+        if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T7:next");
         if (env->ExceptionCheck()) { env->ExceptionClear(); break; }
         jobject loader = env->CallObjectMethod(thread, getCtx);
-        CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T8:getCtx");
+        if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T8:getCtx");
         if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
         if (!loader) continue;
+        // 测试这个加载器能否加载游戏主类。
+        // 注意: 验证标准不能太弱——AppClassLoader 若 classpath 混入其他版本
+        // 残留 jar (如能加载 1.8.9 的 ave), 会被误选。优先要求能加载
+        // MCP/Mojang 名 net/minecraft/client/Minecraft (1.8.9~1.20.1 通用);
+        // 只有全部 loader 都不行时, 才接受能加载其他 mcClass 的 loader。
         jclass mcProbe = LoadClass(env, "net/minecraft/client/Minecraft",
                                    loader, clsCls, forName);
         if (mcProbe) {
             env->DeleteLocalRef(mcProbe);
-            found = loader;
+            found = loader;      // 首选: 能加载标准 Minecraft 类
             break;
         }
+        // 后备: 能加载其他候选 (如 1.8.9 混淆名 ave)
         for (int i = 0; i < kGenMapCount && !found2; ++i) {
             if (strcmp(kGenMaps[i].mcClass, "net/minecraft/client/Minecraft") == 0)
-                continue;
+                continue; // 已测过
             jclass probe = LoadClass(env, kGenMaps[i].mcClass, loader, clsCls, forName);
             if (probe) {
                 env->DeleteLocalRef(probe);
@@ -1510,11 +1502,11 @@ static jobject FindThreadClassLoader(JNIEnv* env, jclass clsCls, jmethodID forNa
             }
         }
     }
-    if (!found) found = found2;
-    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T9:done");
+    if (!found) found = found2; // 无首选时用后备
+    if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T9:done");
     if (env->ExceptionCheck()) env->ExceptionClear();
     return found;
-#endif
+#endif // NO_THREAD_LOADER
 }
 
 static jobject FindGameClassLoader(JNIEnv* env, jclass clsCls, jmethodID forName)
@@ -1523,6 +1515,7 @@ static jobject FindGameClassLoader(JNIEnv* env, jclass clsCls, jmethodID forName
     (void)env; (void)clsCls; (void)forName;
     return NULL;
 #else
+    // 1. Launch.classLoader —— 但必须先验证它能加载游戏类!
     jobject loader = FindLaunchClassLoader(env, clsCls, forName);
     if (loader) {
         bool canLoad = false;
@@ -1534,13 +1527,17 @@ static jobject FindGameClassLoader(JNIEnv* env, jclass clsCls, jmethodID forName
             }
         }
         if (canLoad) return loader;
-        CopyName(g_status->errMsg, sizeof(g_status->errMsg),
-                 "E4:launch-loader-cant-load-game");
+        // 不能加载游戏类 -> 记录后走 app loader
+        if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg),
+                               "E4:launch-loader-cant-load-game");
         env->DeleteLocalRef(loader);
     }
+    // 2. 线程遍历: 1.17+ ModLauncher 环境的主线程 context loader
+    //    = TransformingClassLoader (游戏类加载器), 带 10 秒超时保护
     loader = FindThreadClassLoader(env, clsCls, forName);
     if (loader) return loader;
-    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "E5:system-loader");
+    // 3. 系统类加载器 (app loader, -cp 一定有游戏 jar)
+    if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "E5:system-loader");
     jclass clCls = env->FindClass("java/lang/ClassLoader");
     if (!clCls) { env->ExceptionClear(); return NULL; }
     jmethodID getSys = env->GetStaticMethodID(clCls, "getSystemClassLoader",
@@ -1548,7 +1545,7 @@ static jobject FindGameClassLoader(JNIEnv* env, jclass clsCls, jmethodID forName
     if (!getSys) { env->ExceptionClear(); return NULL; }
     jobject sys = env->CallStaticObjectMethod(clCls, getSys);
     if (env->ExceptionCheck()) env->ExceptionClear();
-    return sys;
+    return sys; // 可能为 NULL (理论不会)
 #endif
 }
 
@@ -1758,14 +1755,17 @@ static void CopyName(char* dst, size_t cap, const char* src)
 //--------------------------------------------------------------------------
 static void UpdateStatus(JNIEnv* env, const Resolved& r)
 {
+    if (!g_status) return;
+
     if (env->PushLocalFrame(32) < 0) {
-        g_status->lastError = 100;
+        g_status->lastError = 100; // 本地引用栈溢出
         return;
     }
     g_status->lastError = 0;
 
     jobject mc = env->CallStaticObjectMethod(r.mcClass, r.getMinecraft);
     if (env->ExceptionCheck()) {
+        // 记录异常类名, 便于诊断 (如双份类副本 / 类初始化失败)
         jthrowable ex = env->ExceptionOccurred();
         env->ExceptionClear();
         jclass exCls = ex ? env->GetObjectClass(ex) : NULL;
@@ -1776,14 +1776,15 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
         g_status->lastError = 101;
     }
     if (!mc) {
+        // 游戏尚未初始化 (主类未加载 / 双份类副本问题)
         g_status->inGame    = 0;
         g_status->canAttack = 0;
         g_status->canPlace  = 0;
         g_status->placeReady = 0;
         g_status->heldItemNull = 0;
         g_status->hitType   = 0;
-        g_status->mcNull    = 1;
-        g_status->tick++;
+        g_status->mcNull    = 1;   // 标记: getMinecraft() 拿不到对象
+        g_status->tick++;          // 即使拿不到主类也计数, 便于判断 worker 是否存活
         env->PopLocalFrame(NULL);
         return;
     }
@@ -1796,6 +1797,7 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
     g_status->inGame = (player != NULL);
 
     if (!player) {
+        // 未进入游戏 (无玩家): 全部清零 (canPlace 也依赖 player, 无法计算)
         g_status->canAttack      = 0;
         g_status->canPlace       = 0;
         g_status->placeReady     = 0;
@@ -1811,9 +1813,13 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
         return;
     }
 
-    g_status->placeReady = r.placeOk ? 1 : 0;
+    // ---- 放置物判定: 手持物品是否为 ItemBlock/BlockItem ----
+    // 只依赖 player (手持), 与准星/mop 无关; 在 mop 检查之前计算。
+    // 链: player.getHeldItem()/getMainHandItem() -> stack.getItem() -> instanceof itemBlockCls
+    // 可选解析: 任一 ID 为 NULL (解析失败) 时 canPlace 恒 0, 不影响 canAttack。
+    g_status->placeReady = r.placeOk ? 1 : 0; // 诊断: 放置物链是否解析成功
     LONG canPlace    = 0;
-    LONG heldNull    = 1;
+    LONG heldNull    = 1; // 默认空手
     CopyName(g_status->heldItemName, sizeof(g_status->heldItemName), NULL);
     if (r.heldItemGetter && r.itemStackCls && r.itemGetItem && r.itemBlockCls) {
         jobject stack = env->CallObjectMethod(player, r.heldItemGetter);
@@ -1824,6 +1830,7 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
             if (env->ExceptionCheck()) { env->ExceptionClear(); g_status->lastError = 111; }
             if (item) {
                 canPlace = env->IsInstanceOf(item, r.itemBlockCls) ? 1 : 0;
+                // 手持物品的 Item 类名 (如 ItemBlock / yo / cds), 便于调试
                 jobject cls = env->GetObjectClass(item);
                 jstring nm  = (jstring)env->CallObjectMethod(cls, r.classGetName);
                 if (env->ExceptionCheck()) { env->ExceptionClear(); g_status->lastError = 112; }
@@ -1841,6 +1848,7 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
     }
 
     if (!mop) {
+        // 未瞄准: canAttack=0, 瞄准相关字段清零; canPlace/heldNull 保留 (独立检测)
         g_status->canAttack      = 0;
         g_status->hitType        = 0;
         g_status->targetLiving   = 0;
@@ -1854,6 +1862,7 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
         return;
     }
 
+    // 命中类型: 0=miss 1=block 2=entity (字段方式或 getter 方式)
     jobject typeObj = r.typeOfHitGetter
         ? env->CallObjectMethod(mop, r.typeOfHitGetter)
         : env->GetObjectField(mop, r.typeOfHitField);
@@ -1863,10 +1872,11 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
     int hit = 0;
     if (typeObj) {
         if (entConst && env->IsSameObject(typeObj, entConst)) hit = 2;
-        else hit = 1;
+        else hit = 1; // BLOCK 或 MISS
     }
     g_status->hitType = hit;
 
+    // 命中实体: 仅当命中实体时读取 (getter 方式下必须保证对象是 EntityHitResult)
     jobject entity = NULL;
     if (hit == 2) {
         entity = r.entityHitGetter
@@ -1882,6 +1892,7 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
         isSelf = (player && env->IsSameObject(entity, player)) ? 1 : 0;
         if (env->ExceptionCheck()) { env->ExceptionClear(); g_status->lastError = 105; }
 
+        // 目标类名 (如 EntityZombie / pr / bfj), 便于调试
         jobject cls = env->GetObjectClass(entity);
         jstring nm  = (jstring)env->CallObjectMethod(cls, r.classGetName);
         if (env->ExceptionCheck()) { env->ExceptionClear(); g_status->lastError = 106; }
@@ -1898,12 +1909,14 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
         CopyName(g_status->targetName, sizeof(g_status->targetName), NULL);
     }
 
+    // 当前手持物品是否允许攻击 (仅 1.8.9 体系有; 空手/武器=true, 食物=false)
     LONG canUseItem = 1;
     if (r.canAttackWithItem) {
         canUseItem = env->CallBooleanMethod(player, r.canAttackWithItem) ? 1 : 0;
         if (env->ExceptionCheck()) { env->ExceptionClear(); g_status->lastError = 107; }
     }
 
+    // 目标是否可被攻击 (现代版本替代 canAttackWithItem 的检查)
     LONG attackable = 1;
     if (r.isAttackable && entity) {
         attackable = env->CallBooleanMethod(entity, r.isAttackable) ? 1 : 0;
@@ -1919,6 +1932,85 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
     g_status->tick++;
 
     env->PopLocalFrame(NULL);
+}
+
+// JVMTI 终极方案: 枚举所有已加载的类, 找到"真 Minecraft 类"
+// (A()/getMinecraft 返回非 null 的那份 —— 无论它由哪个加载器加载,
+//  规避所有双份类副本问题)
+// (以下函数与原项目逐行一致, 供诊断/兜底使用)
+static jclass FindRealMinecraft(JNIEnv* env, JavaVM* vm,
+                                const char* clsSig,     // 如 "Lave;"
+                                const char* getterName, // 如 "A" (可为 NULL)
+                                const char* getterSig)  // 如 "()Lave;"
+{
+    jvmtiEnv* jvmti = NULL;
+    if (vm->GetEnv((void**)&jvmti, JVMTI_VERSION_1_2) != JNI_OK || !jvmti) return NULL;
+
+    jint count = 0;
+    jclass* classes = NULL;
+    if (jvmti->GetLoadedClasses(&count, &classes) != JVMTI_ERROR_NONE) return NULL;
+
+    // 候选 getter: 用户指定的优先, 再加常见别名
+    const char* gNames[8];
+    const char* gSigs[8];
+    int gN = 0;
+    if (getterName) { gNames[gN] = getterName; gSigs[gN] = getterSig; gN++; }
+    const char* extraN[] = { "A", "func_71410_x", "getMinecraft", "getInstance" };
+    const char* extraS[] = { "()Lave;", "()Lave;",
+                             "()Lnet/minecraft/client/Minecraft;",
+                             "()Lnet/minecraft/client/Minecraft;" };
+    for (int i = 0; i < 4 && gN < 8; ++i) {
+        bool dup = false;
+        for (int j = 0; j < gN; ++j) if (strcmp(gNames[j], extraN[i]) == 0) { dup = true; break; }
+        if (!dup) { gNames[gN] = extraN[i]; gSigs[gN] = extraS[i]; gN++; }
+    }
+
+    jclass found = NULL;
+    for (jint i = 0; i < count && !found; ++i) {
+        char* sig = NULL;
+        if (jvmti->GetClassSignature(classes[i], &sig, NULL) != JVMTI_ERROR_NONE) continue;
+        bool match = (clsSig && sig && strcmp(sig, clsSig) == 0);
+        if (!match && clsSig == NULL) match = (sig != NULL); // 不匹配类名时全扫
+        if (sig) jvmti->Deallocate((unsigned char*)sig);
+        if (!match) continue;
+
+        // 方法 1: 调用 getter 返回非 null -> 真类
+        for (int k = 0; k < gN && !found; ++k) {
+            jmethodID m = env->GetStaticMethodID(classes[i], gNames[k], gSigs[k]);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (!m) continue;
+            jobject inst = env->CallStaticObjectMethod(classes[i], m);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (inst) {
+                env->DeleteLocalRef(inst);
+                found = classes[i];
+                break;
+            }
+        }
+        // 方法 2: 静态字段 S/theMinecraft 非 null -> 真类
+        if (!found) {
+            const char* fNames[] = { "S", "theMinecraft" };
+            for (int k = 0; k < 2 && !found; ++k) {
+                char fSig[128];
+                snprintf(fSig, sizeof(fSig), "L%s;", clsSig ? clsSig + 1 : "ave");
+                // 去掉尾部 ';'
+                size_t fl = strlen(fSig);
+                if (fl > 0 && fSig[fl-1] == ';') fSig[fl-1] = 0;
+                jfieldID f = env->GetStaticFieldID(classes[i], fNames[k], fSig);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (!f) continue;
+                jobject v = env->GetStaticObjectField(classes[i], f);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (v) {
+                    env->DeleteLocalRef(v);
+                    found = classes[i];
+                    break;
+                }
+            }
+        }
+    }
+    jvmti->Deallocate((unsigned char*)classes);
+    return found;
 }
 
 //--------------------------------------------------------------------------
@@ -1984,6 +2076,7 @@ static int ExtractMcVersion(const char* text, char* out, size_t cap)
     out[0] = 0;
     if (!text) return 0;
     const char* start = NULL;
+    // 优先: "versions" 目录后的版本号 (最可靠, 各启动器通用)
     const char* p = text;
     while ((p = strstr(p, "versions")) != NULL) {
         const char* s = p + 8;
@@ -1991,6 +2084,7 @@ static int ExtractMcVersion(const char* text, char* out, size_t cap)
         if (s[0] == '1' && s[1] == '.') { start = s; break; }
         p += 8;
     }
+    // 回退: 路径组件开头就是 "1." 的版本号
     if (!start) {
         p = text;
         while ((p = strstr(p, "1.")) != NULL) {
@@ -2010,7 +2104,7 @@ static int ExtractMcVersion(const char* text, char* out, size_t cap)
     while (*q && ((*q >= '0' && *q <= '9') || *q == '.') && n < cap - 1) {
         out[n++] = *q++;
     }
-    while (n > 0 && out[n - 1] == '.') out[--n] = 0;
+    while (n > 0 && out[n - 1] == '.') out[--n] = 0;  // 去尾点
     out[n] = 0;
     return n > 0;
 }
@@ -2053,6 +2147,7 @@ static int FindVersionMapIndex(const char* version)
     for (int i = 0; i < kGenMapCount; ++i) {
         const char* name = kGenMaps[i].name;
         size_t nameLen = strlen(name);
+        // 名字末尾的连续数字段长度必须 == 版本 tag 长度 (精确匹配, 防后缀撞名)
         size_t digits = 0;
         while (digits < nameLen && name[nameLen - 1 - digits] >= '0' &&
                name[nameLen - 1 - digits] <= '9') {
@@ -2076,7 +2171,9 @@ typedef jint (JNICALL* GetCreatedVMs_t)(JavaVM**, jsize, jsize*);
 // ---- SwapBuffers 钩子 ----
 typedef BOOL (WINAPI* SwapBuffersFn)(HDC);
 static SwapBuffersFn g_origSwapBuffers = NULL;
-static LONG   g_attached = 0;      // DllMain 幂等
+static BYTE   g_patch[32];
+static DWORD  g_patchLen = 0;
+static LONG   g_attached = 0;      // DllMain 幂等 (防重复 LoadLibrary 二次钩)
 
 static JavaVM* g_vm = NULL;
 
@@ -2136,6 +2233,7 @@ static bool PromoteResolved(JNIEnv* env, Resolved& r)
         if (!*c[i]) continue;
         jobject g = env->NewGlobalRef(*c[i]);
         if (!g) {
+            // 极端 OOM: 回滚已提升的引用, 调用方放弃本轮
             for (size_t j = 0; j < i; ++j) {
                 if (*c[j]) { env->DeleteGlobalRef(*c[j]); *c[j] = NULL; }
             }
@@ -2173,7 +2271,7 @@ static int ThreadScanStep(JNIEnv* env, DWORD now, DWORD deadline)
     if (now - g_scanStart > kScanTimeoutMs) { ScanAbort(env); return 0; }
 
     if (!g_scanIt) {
-        CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T0:start");
+        if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T0:start");
         g_scanThreadCls = (jclass)ToGlobal(env, env->FindClass("java/lang/Thread"));
         if (!g_scanThreadCls) { env->ExceptionClear(); return -1; }
         g_scanGetAll = env->GetStaticMethodID(g_scanThreadCls, "getAllStackTraces",
@@ -2193,7 +2291,7 @@ static int ThreadScanStep(JNIEnv* env, DWORD now, DWORD deadline)
         if (!keySet || !iterator || !g_scanHasNext || !g_scanNext || !g_scanGetCtx) {
             env->ExceptionClear(); ScanAbort(env); return 0;
         }
-        CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T1:threadCls");
+        if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T1:threadCls");
         jobject map = env->CallStaticObjectMethod(g_scanThreadCls, g_scanGetAll);
         if (env->ExceptionCheck() || !map) { env->ExceptionClear(); ScanAbort(env); return 0; }
         jobject set = env->CallObjectMethod(map, keySet);
@@ -2202,14 +2300,14 @@ static int ThreadScanStep(JNIEnv* env, DWORD now, DWORD deadline)
         g_scanIt = ToGlobal(env, it);
         if (!g_scanIt) return -1;
         g_probeIdx = 0;
-        CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T4:iterator");
+        if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T4:iterator");
     }
 
     while (GetTickCount() < deadline) {
         if (!env->CallBooleanMethod(g_scanIt, g_scanHasNext)) {
             if (env->ExceptionCheck()) env->ExceptionClear();
             ScanAbort(env);
-            return 0;
+            return 0;   // 遍历完: 未找到
         }
         jobject thread = env->CallObjectMethod(g_scanIt, g_scanNext);
         if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
@@ -2217,6 +2315,7 @@ static int ThreadScanStep(JNIEnv* env, DWORD now, DWORD deadline)
         jobject loader = env->CallObjectMethod(thread, g_scanGetCtx);
         if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
         if (!loader) continue;
+        // 首选: 能加载标准 Minecraft 类
         jclass mcProbe = LoadClass(env, "net/minecraft/client/Minecraft",
                                    loader, g_clsCls, g_forName);
         if (mcProbe) {
@@ -2226,10 +2325,11 @@ static int ThreadScanStep(JNIEnv* env, DWORD now, DWORD deadline)
             ScanAbort(env);
             return 1;
         }
+        // 后备: 能加载其他 mcClass 候选 (分帧, 进度存 g_probeIdx)
         while (g_probeIdx < kGenMapCount) {
-            if (GetTickCount() >= deadline) return -1;
+            if (GetTickCount() >= deadline) return -1;   // 下帧继续探测当前 loader
             if (strcmp(kGenMaps[g_probeIdx].mcClass, "net/minecraft/client/Minecraft") == 0) {
-                g_probeIdx++;
+                g_probeIdx++;   // 首选已测过
                 continue;
             }
             jclass probe = LoadClass(env, kGenMaps[g_probeIdx].mcClass,
@@ -2243,7 +2343,7 @@ static int ThreadScanStep(JNIEnv* env, DWORD now, DWORD deadline)
             }
             g_probeIdx++;
         }
-        g_probeIdx = 0;
+        g_probeIdx = 0; // 该 loader 全部候选测完, 换下一个线程
     }
     return -1;
 }
@@ -2277,7 +2377,10 @@ static int FindMapByNamespace(const char* ns, const char* version)
 //--------------------------------------------------------------------------
 static void PumpInner(JNIEnv* env, DWORD now)
 {
+    if (!g_status) return;
+
     switch (g_stage) {
+    // ---- ST_CLS: java/lang/Class + forName ----
     case ST_CLS: {
         jclass c = env->FindClass("java/lang/Class");
         if (!c) { env->ExceptionClear(); return; }
@@ -2290,7 +2393,8 @@ static void PumpInner(JNIEnv* env, DWORD now)
         if (!g_forName) return;
         CopyName(g_status->errMsg, sizeof(g_status->errMsg), "H1:cls-ok");
         g_stage = ST_ENV;
-    } /* fallthrough */
+    } /* fallthrough: 同帧继续 */
+    // ---- ST_ENV: 环境探测 ----
     case ST_ENV: {
 #ifndef NO_ENV_DETECT
         DetectEnv(env, NULL, g_clsCls, g_forName,
@@ -2298,7 +2402,8 @@ static void PumpInner(JNIEnv* env, DWORD now)
 #endif
         CopyName(g_status->errMsg, sizeof(g_status->errMsg), "H2:env-ok");
         g_stage = ST_VER;
-    } /* fallthrough */
+    } /* fallthrough: 同帧继续 */
+    // ---- ST_VER: classpath 版本号提取 ----
     case ST_VER: {
         GetGameVersion(env, g_gameVer, sizeof(g_gameVer));
         g_verHint = g_gameVer[0] ? FindVersionMapIndex(g_gameVer) : -1;
@@ -2311,7 +2416,8 @@ static void PumpInner(JNIEnv* env, DWORD now)
         }
         CopyName(g_status->errMsg, sizeof(g_status->errMsg), "H3:ver-ok");
         g_stage = ST_LAUNCH;
-    } /* fallthrough */
+    } /* fallthrough: 同帧继续 */
+    // ---- ST_LAUNCH: Launch.classLoader ----
     case ST_LAUNCH: {
         g_launchLoader = ToGlobal(env, FindLaunchClassLoader(env, g_clsCls, g_forName));
         if (g_launchLoader) {
@@ -2323,6 +2429,8 @@ static void PumpInner(JNIEnv* env, DWORD now)
         }
         return;
     }
+    // ---- ST_LAUNCH_V: 验证 launch loader 能加载游戏类 ----
+    // 一次性预算较大: 只在启动期跑一次, 全部失败才放弃 (OptiFine 下它只含库)
     case ST_LAUNCH_V: {
         DWORD deadline = now + kLaunchVerifyBudgetMs;
         while (g_probeIdx < kGenMapCount) {
@@ -2346,6 +2454,7 @@ static void PumpInner(JNIEnv* env, DWORD now)
         g_stage = ST_SCAN;
         return;
     }
+    // ---- ST_SCAN: 线程遍历找游戏类加载器 (分帧可续) ----
     case ST_SCAN: {
         DWORD deadline = now + kFrameBudgetMs;
         int rc = ThreadScanStep(env, now, deadline);
@@ -2354,10 +2463,12 @@ static void PumpInner(JNIEnv* env, DWORD now)
                      "thread-loader");
             g_stage = ST_SYS;
         } else if (rc == 0) {
-            g_stage = ST_SYS;
+            g_stage = ST_SYS;   // 未找到: 用系统类加载器
         }
+        // rc == -1: 预算用完, 下帧继续
         return;
     }
+    // ---- ST_SYS: 系统类加载器 + 版本指纹 + loaderName ----
     case ST_SYS: {
         jclass clCls = env->FindClass("java/lang/ClassLoader");
         jmethodID getSys = clCls ? env->GetStaticMethodID(clCls, "getSystemClassLoader",
@@ -2369,14 +2480,18 @@ static void PumpInner(JNIEnv* env, DWORD now)
             CopyName(g_status->loaderName, sizeof(g_status->loaderName),
                      g_sysLoader ? "system-loader" : "(null - 使用 FindClass)");
         }
+        // 版本指纹: classpath 提取失败时, 用原版混淆 mcClass 指纹扫一遍
         int start = (g_verHint >= 0) ? g_verHint
                   : DetectVersionHint(env, g_useGameLoader ? g_gameLoader : g_sysLoader,
                                       g_clsCls, g_forName, now + kLaunchVerifyBudgetMs);
+        // 环境感知优化: 按探测到的 mod 加载器直接定位命名空间表,
+        // 跳过逐张失败的全表轮询 (NeoForge 的 CCNFE 异常路径极慢)。
+        // 解析失败仍会向后轮询 + wrap 全表, 回退逻辑不变。
         if (g_verHint >= 0 && g_status->envName[0]) {
             const char* ns = NULL;
-            if (strstr(g_status->envName, "neoforge")) ns = "mojang";
-            else if (strstr(g_status->envName, "fabric")) ns = "intermediary";
-            else if (strstr(g_status->envName, "forge")) ns = "forge";
+            if (strstr(g_status->envName, "neoforge")) ns = "mojang";          // NeoForge 1.20.2+: 全 Mojang
+            else if (strstr(g_status->envName, "fabric")) ns = "intermediary"; // Fabric: intermediary
+            else if (strstr(g_status->envName, "forge")) ns = "forge";         // Forge: MCP+SRG / Mojang+stable
             if (ns) {
                 int hint2 = FindMapByNamespace(ns, g_gameVer);
                 if (hint2 >= 0) start = hint2;
@@ -2388,7 +2503,8 @@ static void PumpInner(JNIEnv* env, DWORD now)
         g_status->failLog[0] = 0;
         CopyName(g_status->errMsg, sizeof(g_status->errMsg), "H4:loader-ok");
         g_stage = ST_MAPS;
-    } /* fallthrough */
+    } /* fallthrough: 同帧开始尝试映射表 */
+    // ---- ST_MAPS: 尝试映射表 (分帧) ----
     case ST_MAPS: {
         if (g_mapWrap) {
             if (now < g_retryAt) return;
@@ -2406,6 +2522,7 @@ static void PumpInner(JNIEnv* env, DWORD now)
             Resolved tr;
             bool ok = ResolveWith(env, m, tr, loader, g_clsCls, g_forName);
             if (ok) {
+                // 终极验证: getMinecraft() 必须返回真实例, 排除双份类副本
                 jobject inst = env->CallStaticObjectMethod(tr.mcClass, tr.getMinecraft);
                 bool hasInst = (inst != NULL);
                 if (env->ExceptionCheck()) env->ExceptionClear();
@@ -2418,11 +2535,12 @@ static void PumpInner(JNIEnv* env, DWORD now)
                         g_stage = ST_FIX;
                         return;
                     }
-                    return;
+                    return; // 极端 OOM: 放弃本轮, 下帧同表重试
                 }
                 NoteErr(m.name, "getMinecraft()=null(副本)");
                 ok = false;
             }
+            // 当前加载器失败/副本时, 同表换另一个加载器再试 (TCL 与 app loader 都覆盖)
             if (!ok && g_gameLoader && g_sysLoader && g_gameLoader != g_sysLoader) {
                 jobject loader2 = (loader == g_gameLoader) ? g_sysLoader : g_gameLoader;
                 Resolved tr2;
@@ -2441,7 +2559,7 @@ static void PumpInner(JNIEnv* env, DWORD now)
                             g_stage = ST_FIX;
                             return;
                         }
-                        return;
+                        return; // 极端 OOM: 放弃本轮, 下帧同表重试
                     }
                 }
             }
@@ -2454,9 +2572,11 @@ static void PumpInner(JNIEnv* env, DWORD now)
             }
         }
     }
+    // ---- ST_FIX: findLoadedClass 终极修正 (一次性, 几个 JNI 调用无需分帧) ----
     case ST_FIX: {
         const JniMap& mOk = *g_resMap;
 #ifndef NO_REAL_FIX
+        // 终极修正 A: findLoadedClass 拿游戏已加载的真类, 用它的类加载器重新解析
         jclass realMc = FindLoadedGameClass(env, g_launchLoader, mOk.mcClass,
                                             g_clsCls, g_forName,
                                             mOk.getMinecraft, mOk.mcSig);
@@ -2482,16 +2602,18 @@ static void PumpInner(JNIEnv* env, DWORD now)
         g_status->ready = 1;
         CopyName(g_status->mappingName, sizeof(g_status->mappingName), g_res.name);
         CopyName(g_status->errMsg, sizeof(g_status->errMsg), "H5:ready");
-        Log("ready: map=%s env=%s ver=%s loader=%s",
+        Log("ready: map=%s env=%s ver=%s loader=%s",   // 本项目追加: 就绪日志
             g_status->mappingName, g_status->envName,
             g_gameVer[0] ? g_gameVer : "?", g_status->loaderName);
         g_stage = ST_STEADY;
         return;
     }
+    // ---- ST_STEADY: 采样 + 上报 (5ms 节流) ----
     case ST_STEADY: {
         if (g_status->mcNull) {
             if (!g_nullSince) g_nullSince = now;
             else if (now - g_nullSince >= 500) {
+                // 连续 0.5 秒拿不到 mc (双份类副本): 切换加载器重新解析
                 g_nullSince = now;
                 if (g_gameLoader && g_sysLoader) g_useGameLoader = !g_useGameLoader;
                 else if (g_gameLoader) g_useGameLoader = true;
@@ -2510,7 +2632,8 @@ static void PumpInner(JNIEnv* env, DWORD now)
         if (now - g_lastWork >= kSamplePeriodMs) {
             g_lastWork = now;
             UpdateStatus(env, g_res);
-            if (g_s.dbgClicks) {
+            // UDP 已移除: 状态仅经共享内存发布
+            if (g_s.dbgClicks) {   // 本项目追加: 调试日志 (状态变化)
                 static LONG lastAtk = -1, lastPlace = -1;
                 if (lastAtk != g_status->canAttack || lastPlace != g_status->canPlace) {
                     lastAtk = g_status->canAttack;
@@ -2536,7 +2659,8 @@ static void PumpFrame(JNIEnv* env)
 }
 
 //--------------------------------------------------------------------------
-// gdi32!SwapBuffers 钩子: 解析状态 + 连点 + 菜单绘制都在此帧内完成
+// gdi32!SwapBuffers 钩子 (与原项目逐行一致; 仅在其后追加本项目的
+// 连点/菜单逻辑: ClickTick / UpdateOverlay, 以及菜单热键轮询)
 //--------------------------------------------------------------------------
 static BOOL WINAPI HookSwapBuffers(HDC hdc)
 {
@@ -2549,6 +2673,7 @@ static BOOL WINAPI HookSwapBuffers(HDC hdc)
     PollInsertKey();
     PollMenuEvent();
 
+    // 惰性获取 JavaVM (JNI_GetCreatedJavaVMs 不附着线程, 不触发 ThreadStart)
     if (!g_vm) {
         HMODULE jvm = GetModuleHandleA("jvm.dll");
         if (jvm) {
@@ -2563,6 +2688,9 @@ static BOOL WINAPI HookSwapBuffers(HDC hdc)
     }
     if (g_vm) {
         JNIEnv* env = NULL;
+        // 复用调用线程已有的 JNIEnv (Client thread 是游戏自建的 Java 线程,
+        // 天然 attached)。绝不 AttachCurrentThread —— 非 Java 线程调用时
+        // GetEnv 返回 EDETACHED, 直接跳过本帧。
         jint rc = g_vm->GetEnv((void**)&env, JNI_VERSION_1_6);
         if (rc == JNI_OK && env) {
             static bool g_envLogged = false;
@@ -2574,14 +2702,16 @@ static BOOL WINAPI HookSwapBuffers(HDC hdc)
                 g_envFailLogged = true;
                 Log("first-frame: getenv=%d (not JNI_OK)", (int)rc);
             }
-            if (g_stage == ST_CLS) {
+            if (g_status && g_stage == ST_CLS) {
+                // 诊断 (仅解析前覆盖, 不干扰后续阶段信息)
                 snprintf(g_status->errMsg, sizeof(g_status->errMsg), "HG:getenv=%d", (int)rc);
             }
         }
-    } else if (g_stage == ST_CLS) {
+    } else if (g_status && g_stage == ST_CLS) {
         CopyName(g_status->errMsg, sizeof(g_status->errMsg), "HV:no-vm");
     }
 
+    // ---- 以下为本项目追加 (原项目没有): 连点 + 游戏内菜单 ----
     ClickTick(hdc);
 
     BOOL r = g_origSwapBuffers ? g_origSwapBuffers(hdc) : FALSE;
@@ -2591,10 +2721,25 @@ static BOOL WINAPI HookSwapBuffers(HDC hdc)
 }
 
 //--------------------------------------------------------------------------
-// 内联钩子 (x64): 覆盖 gdi32!SwapBuffers 的 12 字节导出存根
-// (FF 25 rel32 + 6 字节 CC 填充) 为绝对跳转 (mov rax,imm64; jmp rax)。
-// 真实函数地址从存根的槽位读出 (与参考实现完全一致的装法)。
+// 内联钩子 (x64): 5 字节 rel32 jmp (或 12 字节 mov rax,imm64;jmp rax) +
+// 附近分配的 trampoline (原指令 + jmp back)。
+// 以下代码与原项目 MCCombatStatusJni.cpp (V65.1) 逐行一致。
 //--------------------------------------------------------------------------
+static bool FitsRel32(void* from, void* to)
+{
+    INT64 d = (INT64)((BYTE*)to - (BYTE*)from);
+    return d >= -0x80000000LL && d <= 0x7FFFFFFFLL;
+}
+
+static bool WriteRelJmp(BYTE* dst, void* to)
+{
+    if (!FitsRel32(dst, to)) return false;
+    dst[0] = 0xE9;
+    INT32 off = (INT32)((BYTE*)to - (dst + 5));
+    memcpy(dst + 1, &off, 4);
+    return true;
+}
+
 static void WriteAbsJmp(BYTE* dst, void* to)
 {
     dst[0] = 0x48; dst[1] = 0xB8;               // mov rax, imm64
@@ -2602,6 +2747,138 @@ static void WriteAbsJmp(BYTE* dst, void* to)
     dst[10] = 0xFF; dst[11] = 0xE0;             // jmp rax
 }
 
+// modrm 长度 (modrm 位于 p[i]); rm==4 时任何 mod 下都存在 SIB 字节
+static int ModRmLen(const BYTE* p, int i)
+{
+    BYTE modrm = p[i];
+    int mod = modrm >> 6, rm = modrm & 7;
+    int len = 1;
+    if (rm == 4) {                                   // SIB
+        len += 1;
+        if (mod == 0 && (p[i + 1] & 7) == 5) len += 4;
+    }
+    if (mod == 0 && rm == 5)      len += 4;          // disp32 (无 SIB)
+    else if (mod == 1)            len += 1;          // disp8
+    else if (mod == 2)            len += 4;          // disp32
+    return len;
+}
+
+// 最小 x86-64 长度反汇编器: 只覆盖 Windows 函数序言常见指令。
+// 返回指令字节数, 无法识别返回 0。
+static int InsnLen64(const BYTE* p)
+{
+    int i = 0;
+    bool rexW = false;
+    while (i < 15) {
+        BYTE b = p[i];
+        if (b >= 0x40 && b <= 0x4F) { rexW = (b & 8) != 0; i++; continue; }
+        if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3) { i++; continue; }
+        break;
+    }
+    if (i >= 15) return 0;
+    BYTE op = p[i];
+    if (op == 0x0F) {
+        BYTE op2 = p[i + 1];
+        if (op2 >= 0x80 && op2 <= 0x8F) return i + 6;                 // jcc rel32
+        if (op2 == 0x1E || op2 == 0x1F) return i + 2 + ModRmLen(p, i + 2); // nop (含 endbr64)
+        if (op2 == 0x05 || op2 == 0x34) return i + 2;                 // syscall/sysenter
+        return 0;
+    }
+    if (op >= 0x50 && op <= 0x5F) return i + 1;                       // push/pop r64
+    if (op >= 0x70 && op <= 0x7F) return i + 2;                       // jcc rel8
+    if (op == 0xEB) return i + 2;                                     // jmp rel8
+    if (op == 0xE9) return i + 5;                                     // jmp rel32
+    if (op == 0xE8) return i + 5;                                     // call rel32
+    if (op >= 0xB8 && op <= 0xBF) return i + 1 + (rexW ? 8 : 4);      // mov r, imm
+    if (op == 0x68) return i + 5;                                     // push imm32
+    if (op == 0x6A) return i + 2;                                     // push imm8
+    if (op == 0x80) return i + 2 + ModRmLen(p, i + 1) + 1;            // group1 r/m8, imm8
+    if (op == 0x81) return i + 2 + ModRmLen(p, i + 1) + 4;            // group1 r/m, imm32
+    if (op == 0x83) return i + 2 + ModRmLen(p, i + 1) + 1;            // group1 r/m, imm8
+    if (op == 0xC7) return i + 2 + ModRmLen(p, i + 1) + 4;            // mov r/m, imm32
+    if (op == 0x89 || op == 0x8B || op == 0x8D || op == 0x03 || op == 0x0B ||
+        op == 0x2B || op == 0x33 || op == 0x3B || op == 0x01 || op == 0x09 ||
+        op == 0x85 || op == 0x39 || op == 0x31 || op == 0x29 || op == 0x23 ||
+        op == 0x63 || op == 0x8F || op == 0x21 || op == 0x87 || op == 0x86)
+        return i + 1 + ModRmLen(p, i + 1);
+    if (op == 0xFF) return i + 1 + ModRmLen(p, i + 1);                 // call/jmp r/m
+    if (op == 0xC3) return i + 1;                                     // ret
+    if (op == 0xC2) return i + 3;                                     // ret imm16
+    if (op == 0xCC) return i + 1;                                     // int3
+    if (op == 0x90) return i + 1;                                     // nop
+    return 0;
+}
+
+// 追跳存根链到真实函数体:
+//   gdi32!SwapBuffers 等系统导出常以 FF 25 disp32 (jmp [rip+disp32]) 或
+//   E9 rel32 开头 (跳转存根)。若直接钩存根, trampoline 原样复制含 RIP
+//   相对寻址的指令会因地址偏移而跳飞。必须追到真实函数体再打补丁。
+static BYTE* ResolveRealEntry(BYTE* entry)
+{
+    for (int hop = 0; hop < 8 && entry; ++hop) {
+        if (entry[0] == 0xFF && entry[1] == 0x25) {          // jmp [rip+disp32]
+            INT32 disp;
+            memcpy(&disp, entry + 2, 4);
+            BYTE** slot = (BYTE**)(entry + 6 + disp);        // 槽在导出者自身数据段内
+            entry = *slot;
+            continue;
+        }
+        if (entry[0] == 0xE9) {                              // jmp rel32
+            INT32 disp;
+            memcpy(&disp, entry + 1, 4);
+            entry = entry + 5 + disp;
+            continue;
+        }
+        return entry;   // 真实函数体
+    }
+    return NULL;
+}
+
+// 检查已解码窗口内是否存在需要重定位的指令
+// (相对跳转/调用, 或 mod=00 rm=101 的 RIP 相对寻址) —— 蹦床原样复制
+// 这类指令会因地址偏移而跳飞, 一律拒绝内联补丁。
+static bool InsnNeedsReloc(const BYTE* p, int len)
+{
+    if (len <= 0) return true;
+    // 跳过指令前缀
+    int i = 0;
+    while (i < len) {
+        BYTE b = p[i];
+        if ((b >= 0x40 && b <= 0x4F) || b == 0x66 || b == 0x67 ||
+            b == 0xF0 || b == 0xF2 || b == 0xF3) { i++; continue; }
+        break;
+    }
+    if (i >= len) return true;
+    BYTE op = p[i];
+    if (op == 0xE8 || op == 0xE9 || op == 0xEB ||
+        (op >= 0x70 && op <= 0x7F) ||
+        (op == 0x0F && i + 1 < len && p[i+1] >= 0x80 && p[i+1] <= 0x8F) ||
+        (op == 0xFF && i + 1 < len && (p[i+1] & 0xC7) == 0x25))
+        return true;
+    if (i + 1 < len) {
+        BYTE modrm = p[i + 1];
+        if ((modrm >> 6) == 0 && (modrm & 7) == 5) return true;  // [rip+disp32]
+    }
+    return false;
+}
+
+// 模块映像大小 (PE 头解析, 无需 psapi)
+static DWORD ModuleSizeOf(HMODULE m)
+{
+    BYTE* base = (BYTE*)m;
+    if (!base) return 0;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    return nt->OptionalHeader.SizeOfImage;
+}
+
+// 安装 gdi32!SwapBuffers 钩子 (与参考实现完全一致的装法):
+// gdi32 导出入口是 "FF 25 rel32 + 6 字节 CC 填充" 的存根 —— 直接把整段
+// 12 字节覆盖为绝对跳转 (mov rax, imm64; jmp rax) 指向本模块钩子。
+// 真实函数地址从存根的槽位读出; 槽位若未解析, 读到的解析器在首次调用
+// 时会自行解析并尾跳到真实实现 (槽位我们没动, 行为安全)。
 static bool InstallSwapBuffersHook(void)
 {
     HMODULE gdi = GetModuleHandleA("gdi32.dll");
@@ -2617,7 +2894,10 @@ static bool InstallSwapBuffersHook(void)
     if (!g_origSwapBuffers) return false;
 
     BYTE patch[12];
-    WriteAbsJmp(patch, (void*)(void(*)())&HookSwapBuffers);
+    patch[0] = 0x48; patch[1] = 0xB8;              // mov rax, imm64
+    void* hookAddr = (void*)(void(*)())&HookSwapBuffers;
+    memcpy(patch + 2, &hookAddr, 8);
+    patch[10] = 0xFF; patch[11] = 0xE0;            // jmp rax
 
     DWORD old = 0;
     if (!VirtualProtect(stub, 12, PAGE_EXECUTE_READWRITE, &old)) return false;
@@ -2686,10 +2966,10 @@ __declspec(dllexport) BOOL WINAPI IsJniReady(void)
     return g_status->ready ? TRUE : FALSE;
 }
 
-__declspec(dllexport) BOOL WINAPI GetStatus(Status* out)
+__declspec(dllexport) BOOL WINAPI GetStatus(CombatStatus* out)
 {
     if (!out) return FALSE;
-    *out = g_st;
+    *out = *g_status;
     return TRUE;
 }
 
@@ -2706,11 +2986,13 @@ __declspec(dllexport) void WINAPI DbgOpenMenu(void)
 } // extern "C"
 
 //--------------------------------------------------------------------------
-// DLL 入口: 不创建任何线程、不创建 socket、不创建共享内存。
-// 全部工作在游戏渲染线程内由 SwapBuffers 钩子驱动。
+// DLL 入口 (与原项目 V65.1 同顺序, 仅做删减与增补):
+//   原项目:  DllMain -> g_attached -> HideModuleFromPeb -> 共享内存健康
+//            检查(防重复注入) -> 共享内存创建 -> 钩子安装
+//   本项目:  DllMain -> g_attached -> HideModuleFromPeb -> 存根补丁检查
+//            (防重复注入, 替代共享内存健康检查, 不创建任何新内核对象)
+//            -> 状态初始化 -> [追加: 设置加载/菜单事件] -> 钩子安装
 //--------------------------------------------------------------------------
-static HANDLE g_guardMutex = NULL;
-
 BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
@@ -2718,25 +3000,30 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         if (InterlockedExchange(&g_attached, 1)) return TRUE; // 防重复 LoadLibrary 二次初始化
         g_hInst = hInst;
 
-        // 单实例守卫: 同名互斥体已存在说明本进程已注入过
-        HANDLE mut = CreateMutexA(NULL, FALSE, "Local\\MCInGameClicker");
-        if (mut && GetLastError() == ERROR_ALREADY_EXISTS) return TRUE;
-        g_guardMutex = mut;
-
-        // 外部菜单命令事件 (injector -menu)
-        g_menuEvent = CreateEventA(NULL, TRUE, FALSE, "Local\\MCInGameMenuEvent");
-
         // 与参考实现一致: 从 PEB 模块链表摘除自身 (模块枚举不可见)
         HideModuleFromPeb(hInst);
 
-        memset(&g_st, 0, sizeof(g_st));
-        g_st.magic   = kMagic;
-        g_st.version = kVersion;
-        CopyName(g_st.errMsg, sizeof(g_st.errMsg), "H0:dllmain-init");
+        // 防重复注入 (替代原项目的共享内存健康检查):
+        // 若 gdi32!SwapBuffers 存根已被补丁 (48 B8 开头), 说明本 DLL 已在运行
+        {
+            HMODULE gdi = GetModuleHandleA("gdi32.dll");
+            if (gdi) {
+                BYTE* stub = (BYTE*)(void*)GetProcAddress(gdi, "SwapBuffers");
+                if (stub && stub[0] == 0x48 && stub[1] == 0xB8) return TRUE;
+            }
+        }
 
+        memset(g_status, 0, sizeof(*g_status));
+        g_status->magic   = kMagic;
+        g_status->version = kVersion;
+        CopyName(g_status->errMsg, sizeof(g_status->errMsg), "H0:dllmain-init");
+
+        // ---- 以下为本项目追加 (原项目没有): 设置加载 + 菜单命令事件 ----
         LoadSettings();
         g_lastFrame = GetTickCount();
+        g_menuEvent = CreateEventA(NULL, TRUE, FALSE, "Local\\MCInGameMenuEvent");
 
+        // 钩住 gdi32!SwapBuffers (游戏渲染线程每帧调用)
         if (!InstallSwapBuffersHook()) {
             Log("dllmain: init, peb-hidden=%d, HOOK-INSTALL-FAIL",
                 PebStillVisible(hInst) ? 0 : 1);
@@ -2757,7 +3044,6 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         if (g_ovl && IsWindow(g_ovl)) DestroyWindow(g_ovl);
         if (g_memDC) DeleteDC(g_memDC);
         if (g_menuEvent) { CloseHandle(g_menuEvent); g_menuEvent = NULL; }
-        if (g_guardMutex) { CloseHandle(g_guardMutex); g_guardMutex = NULL; }
         // 钩子有意不还原: DLL 与进程同生命周期, 退出阶段还原补丁
         // 会与其他仍在执行的线程竞态, 无意义且有崩溃风险。
     }
