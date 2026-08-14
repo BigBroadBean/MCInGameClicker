@@ -1,0 +1,4 @@
+test/swapclient/run*.log
+test/swapclient/swapstub_crash.txt
+test/swapclient/out11/
+*.log
