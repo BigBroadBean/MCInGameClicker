@@ -1,6 +1,9 @@
 //============================================================================
-//  MCInGame.dll  (v1.2)
+//  MCInGame.dll  (v1.3)
 //  注入到 Minecraft (java/javaw) 进程中的游戏内连点器。
+//
+//  v1.3: CPS 支持一位小数 (0.5~50.0, 0.1 步进; 内部以 0.1 单位存储,
+//        与原连点器一致), 点击间隔按 10000/cps10 毫秒精确计算。
 //
 //  v1.2 菜单 (按原连点器 v2.9 的 UI 设计重做):
 //    * 独立分层悬浮窗 + 内存 DC 双缓存合成 (UpdateLayeredWindow, 不闪烁)
@@ -112,15 +115,16 @@ static void Log(const char* fmt, ...)
 //--------------------------------------------------------------------------
 // 设置 (INI) —— %APPDATA%\MCInGameClicker\settings.ini
 //--------------------------------------------------------------------------
-static const int kCpsMin = 5;
-static const int kCpsMax = 50;    // 上限 50 (与原连点器默认上限一致)
+// CPS 以 0.1 为单位存储 (与原连点器一致): 5=0.5 CPS, 500=50.0 CPS
+static const int kCpsMin10 = 5;     // 0.5 CPS
+static const int kCpsMax10 = 500;   // 50.0 CPS (上限与原版一致)
 
 struct Settings {
     int master;      // 总开关 (连点)
     int left;        // 左键连点
     int right;       // 右键连点
-    int cpsLeft;     // 左键 CPS (5~100, 连续)
-    int cpsRight;    // 右键 CPS (5~100, 连续)
+    int cpsLeft10;   // 左键 CPS ×10 (5~500, 0.1 步进)
+    int cpsRight10;  // 右键 CPS ×10
     int keep;        // 保持连点 (无需按住鼠标)
     int gatk;        // 能攻击才点
     int gplace;      // 能放置才点
@@ -137,14 +141,22 @@ struct Settings {
 };
 
 // 默认热键: F8 总开关 / F6 左键 / F7 右键 / F9 保持 (F6=117 F7=118 F8=119 F9=120)
-static Settings g_s = { 0, 1, 1, 20, 20, 0, 0, 0, 0,
+// 默认 CPS 200 = 20.0/s
+static Settings g_s = { 0, 1, 1, 200, 200, 0, 0, 0, 0,
                         119, 117, 118, 120, 0, 0, 0, 0, 0 };
 
-static int clampCps(int v)
+static int clampCps10(int v)
 {
-    if (v < kCpsMin) v = kCpsMin;
-    if (v > kCpsMax) v = kCpsMax;
+    if (v < kCpsMin10) v = kCpsMin10;
+    if (v > kCpsMax10) v = kCpsMax10;
     return v;
+}
+
+// CPS 文本: 整数值省略小数位, 否则保留一位小数
+static void CpsTextW(int v10, wchar_t* out, int cap)
+{
+    if (v10 % 10 == 0) swprintf(out, cap, L"%d/s", v10 / 10);
+    else swprintf(out, cap, L"%d.%d/s", v10 / 10, v10 % 10);
 }
 
 static void IniPath(char* out, size_t cap)
@@ -161,8 +173,8 @@ static int ReadInt(const char* t) { return atoi(t ? t : "0"); }
 
 static void ClampCps(void)
 {
-    g_s.cpsLeft  = clampCps(g_s.cpsLeft);
-    g_s.cpsRight = clampCps(g_s.cpsRight);
+    g_s.cpsLeft10  = clampCps10(g_s.cpsLeft10);
+    g_s.cpsRight10 = clampCps10(g_s.cpsRight10);
 }
 
 static void LoadSettings(void)
@@ -182,8 +194,10 @@ static void LoadSettings(void)
         if      (!strcmp(k, "master"))    g_s.master    = ReadInt(v);
         else if (!strcmp(k, "left"))      g_s.left      = ReadInt(v);
         else if (!strcmp(k, "right"))     g_s.right     = ReadInt(v);
-        else if (!strcmp(k, "cpsLeft"))   g_s.cpsLeft   = ReadInt(v);
-        else if (!strcmp(k, "cpsRight"))  g_s.cpsRight  = ReadInt(v);
+        else if (!strcmp(k, "cpsLeft10")) g_s.cpsLeft10  = ReadInt(v);
+        else if (!strcmp(k, "cpsRight10"))g_s.cpsRight10 = ReadInt(v);
+        else if (!strcmp(k, "cpsLeft"))   g_s.cpsLeft10  = ReadInt(v) * 10;  // 旧版整数 CPS 迁移
+        else if (!strcmp(k, "cpsRight"))  g_s.cpsRight10 = ReadInt(v) * 10;
         else if (!strcmp(k, "keep"))      g_s.keep      = ReadInt(v);
         else if (!strcmp(k, "gatk"))      g_s.gatk      = ReadInt(v);
         else if (!strcmp(k, "gplace"))    g_s.gplace    = ReadInt(v);
@@ -214,11 +228,11 @@ static void SaveSettings(void)
     FILE* f = fopen(path, "wb");
     if (!f) return;
     fprintf(f,
-        "master=%d\nleft=%d\nright=%d\ncpsLeft=%d\ncpsRight=%d\n"
+        "master=%d\nleft=%d\nright=%d\ncpsLeft10=%d\ncpsRight10=%d\n"
         "keep=%d\ngatk=%d\ngplace=%d\ngcursor=%d\n"
         "hotMaster=%d\nhotLeft=%d\nhotRight=%d\nhotKeep=%d\n"
         "hotGatk=%d\nhotGplace=%d\nhotGcursor=%d\ndbgClicks=%d\ndbgDump=%d\n",
-        g_s.master, g_s.left, g_s.right, g_s.cpsLeft, g_s.cpsRight,
+        g_s.master, g_s.left, g_s.right, g_s.cpsLeft10, g_s.cpsRight10,
         g_s.keep, g_s.gatk, g_s.gplace, g_s.gcursor,
         g_s.hotMaster, g_s.hotLeft, g_s.hotRight, g_s.hotKeep,
         g_s.hotGatk, g_s.hotGplace, g_s.hotGcursor, g_s.dbgClicks, g_s.dbgDump);
@@ -273,8 +287,8 @@ static const wchar_t* const kItemTips[ITEM_COUNT] = {
     L"连点总开关；关闭后左右键都不连点",
     L"开=按住左键连点；保持模式开启时无需按住",
     L"开=按住右键连点；保持模式开启时无需按住",
-    L"左键每秒点击次数 (5~50)；按住左右拖动 / 滚轮 / ←→ 调整",
-    L"右键每秒点击次数 (5~50)；按住左右拖动 / 滚轮 / ←→ 调整",
+    L"左键每秒点击次数 (0.5~50, 0.1 步进)；按住左右拖动 / 滚轮 / ←→ 调整",
+    L"右键每秒点击次数 (0.5~50, 0.1 步进)；按住左右拖动 / 滚轮 / ←→ 调整",
     L"开=无需按住鼠标持续连点；关=按住左/右键才点",
     L"开=仅准星瞄准可攻击生物时才点左键",
     L"开=仅手持放置物 (方块类) 时才点右键",
@@ -360,7 +374,7 @@ static const COLORREF CLR_TRACK = RGB(56, 64, 88);     // 滑块轨道/开关关
 
 // 点击状态 (渲染线程单线程访问)
 static bool  g_downL = false, g_downR = false;
-static long  g_accL = 0, g_accR = 0;
+static double g_accL = 0, g_accR = 0;
 static DWORD g_lastFrame = 0;
 
 static HFONT  g_fTitle = NULL, g_fRow = NULL, g_fDim = NULL;
@@ -399,8 +413,8 @@ static void ToggleItem(void)
     case IT_MASTER: g_s.master = !g_s.master; break;
     case IT_LEFT:   g_s.left   = !g_s.left;   break;
     case IT_RIGHT:  g_s.right  = !g_s.right;  break;
-    case IT_CPSL:   g_s.cpsLeft  = clampCps(g_s.cpsLeft + 1); break;
-    case IT_CPSR:   g_s.cpsRight = clampCps(g_s.cpsRight + 1); break;
+    case IT_CPSL:   g_s.cpsLeft10  = clampCps10(g_s.cpsLeft10 + 1); break;
+    case IT_CPSR:   g_s.cpsRight10 = clampCps10(g_s.cpsRight10 + 1); break;
     case IT_KEEP:   g_s.keep   = !g_s.keep;   break;
     case IT_GATK:   g_s.gatk   = !g_s.gatk;   break;
     case IT_GPLACE: g_s.gplace = !g_s.gplace; break;
@@ -419,8 +433,8 @@ static void AdjustItem(int dir)
 {
     if (dir == 0) return;
     switch ((ItemId)(int)g_sel) {
-    case IT_CPSL:   g_s.cpsLeft  = clampCps(g_s.cpsLeft + dir); break;
-    case IT_CPSR:   g_s.cpsRight = clampCps(g_s.cpsRight + dir); break;
+    case IT_CPSL:   g_s.cpsLeft10  = clampCps10(g_s.cpsLeft10 + dir); break;
+    case IT_CPSR:   g_s.cpsRight10 = clampCps10(g_s.cpsRight10 + dir); break;
     case IT_HOTMASTER: case IT_HOTLEFT: case IT_HOTRIGHT: case IT_HOTKEEP:
     case IT_HOTGATK: case IT_HOTGPLACE: case IT_HOTCURSOR:
         g_capturing = g_sel;   // ←→ 也进入绑定
@@ -730,6 +744,21 @@ static int CpsHitZone(int item, int x, int y)
     return 0;
 }
 
+// CPS 轨道像素宽度 (与 DrawSlider 一致)
+static int CpsTrackW(void)
+{
+    int chipsL = MENU_W - 12 - (CPS_CHIP_W + CPS_CHIP_GAP) * CPS_CHIP_COUNT;
+    return chipsL - 6 - CPS_TRACK_L;
+}
+
+// 轨道 x 坐标 -> CPS 值 (0.1 单位, 按比例映射, 与原连点器一致)
+static int CpsFromX(int x)
+{
+    int w = CpsTrackW();
+    if (w <= 0) return kCpsMin10;
+    return clampCps10(kCpsMin10 + (int)((x - CPS_TRACK_L) * (kCpsMax10 - kCpsMin10) / w));
+}
+
 // 悬浮窗消息处理: 点击/拖动滑 CPS/滚轮/悬停
 static LRESULT CALLBACK OverlayProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -743,12 +772,12 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (item == IT_CPSL || item == IT_CPSR) {
             int zone = CpsHitZone(item, pt.x, pt.y);
             if (zone >= 2) {                     // 点档位块: 直接设值
-                int v = kCpsChips[zone - 2];
-                if (item == IT_CPSL) g_s.cpsLeft = v; else g_s.cpsRight = v;
+                int v = kCpsChips[zone - 2] * 10;
+                if (item == IT_CPSL) g_s.cpsLeft10 = v; else g_s.cpsRight10 = v;
                 ItemChanged();
             } else if (zone == 1) {              // 点轨道: 跳值并进入拖动
-                int v = clampCps(kCpsMin + (pt.x - CPS_TRACK_L) / 2);
-                if (item == IT_CPSL) g_s.cpsLeft = v; else g_s.cpsRight = v;
+                int v = CpsFromX(pt.x);
+                if (item == IT_CPSL) g_s.cpsLeft10 = v; else g_s.cpsRight10 = v;
                 ItemChanged();
                 g_dragItem = item;
                 g_dragX = pt.x;
@@ -766,12 +795,12 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (!g_menuOpen) break;
         POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
         g_hover = HitItem(pt.x, pt.y);
-        if (g_dragItem >= 0) {                    // 滑动调 CPS: 每 2px = 1 CPS
-            int v = clampCps(g_dragVal + (pt.x - g_dragX) / 2);
+        if (g_dragItem >= 0) {                    // 滑动调 CPS: 按轨道比例
+            int v = CpsFromX(pt.x);
             if (g_dragItem == IT_CPSL) {
-                if (g_s.cpsLeft != v) { g_s.cpsLeft = v; ItemChanged(); }
+                if (g_s.cpsLeft10 != v) { g_s.cpsLeft10 = v; ItemChanged(); }
             } else {
-                if (g_s.cpsRight != v) { g_s.cpsRight = v; ItemChanged(); }
+                if (g_s.cpsRight10 != v) { g_s.cpsRight10 = v; ItemChanged(); }
             }
         }
         return 0;
@@ -783,10 +812,10 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (!g_menuOpen) break;
         int d = (short)HIWORD(wp);
         if (g_hover == IT_CPSL) {
-            g_s.cpsLeft = clampCps(g_s.cpsLeft + (d > 0 ? 1 : -1));
+            g_s.cpsLeft10 = clampCps10(g_s.cpsLeft10 + (d > 0 ? 1 : -1));  // ±0.1
             ItemChanged();
         } else if (g_hover == IT_CPSR) {
-            g_s.cpsRight = clampCps(g_s.cpsRight + (d > 0 ? 1 : -1));
+            g_s.cpsRight10 = clampCps10(g_s.cpsRight10 + (d > 0 ? 1 : -1));
             ItemChanged();
         } else {
             g_sel = (g_sel + ITEM_COUNT + (d > 0 ? -1 : 1)) % ITEM_COUNT;
@@ -911,7 +940,7 @@ static void DrawSwitch(HDC dc, const RECT& r, bool on)
     FillEll(dc, krr, g_brKnob);
 }
 
-// CPS 滑块: 轨道 + 强调色填充 + 白色拇指 + 档位块
+// CPS 滑块: 轨道 + 强调色填充 + 白色拇指 + 档位块 (value 为 0.1 单位)
 static void DrawSlider(HDC dc, int item, int value)
 {
     int y = RowY(item) + 24;
@@ -919,7 +948,7 @@ static void DrawSlider(HDC dc, int item, int value)
     int trackR = chipsL - 6;
     RECT trk = { CPS_TRACK_L, y - 3, trackR, y + 3 };
     FillRound(dc, trk, 4, g_brTrack);
-    int tx = CPS_TRACK_L + (value - kCpsMin) * (trackR - CPS_TRACK_L) / (kCpsMax - kCpsMin);
+    int tx = CPS_TRACK_L + (value - kCpsMin10) * (trackR - CPS_TRACK_L) / (kCpsMax10 - kCpsMin10);
     if (tx > CPS_TRACK_L + 2) {
         RECT fill = { CPS_TRACK_L, y - 3, tx, y + 3 };
         FillRound(dc, fill, 4, g_brAcc);
@@ -930,7 +959,7 @@ static void DrawSlider(HDC dc, int item, int value)
     for (int k = 0; k < CPS_CHIP_COUNT; ++k) {
         RECT ch = { chipsL + k * (CPS_CHIP_W + CPS_CHIP_GAP), y - 8,
                     chipsL + k * (CPS_CHIP_W + CPS_CHIP_GAP) + CPS_CHIP_W, y + 8 };
-        if (kCpsChips[k] == value) FillRound(dc, ch, 6, g_brAcc);
+        if (kCpsChips[k] * 10 == value) FillRound(dc, ch, 6, g_brAcc);
         else RingRound(dc, ch, 6, CLR_BRD);
         wchar_t lb[8];
         swprintf(lb, 8, L"%d", kCpsChips[k]);
@@ -957,7 +986,7 @@ static void ComposeFrame(void)
     SelectObject(dc, g_fTitle);
     SetTextColor(dc, CLR_WHT);
     RECT rt = { 12, 0, MENU_W - 12, TITLE_H };
-    DrawTextW(dc, L"MCInGame 连点器  v1.2", -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextW(dc, L"MCInGame 连点器  v1.3", -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     RECT rl = { 12, TITLE_H - 1, MENU_W - 12, TITLE_H };
     FillRect(dc, &rl, g_brAcc);
 
@@ -1012,9 +1041,9 @@ static void ComposeFrame(void)
             SetTextColor(dc, CLR_TXT);
             RECT rn = { rr.left + 8, ry, 120, ry + 24 };
             DrawTextW(dc, kItemNames[i], -1, &rn, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            int v = (i == IT_CPSL) ? g_s.cpsLeft : g_s.cpsRight;
+            int v = (i == IT_CPSL) ? g_s.cpsLeft10 : g_s.cpsRight10;
             wchar_t val[16];
-            swprintf(val, 16, L"%d/s", v);
+            CpsTextW(v, val, 16);
             SetTextColor(dc, CLR_ACC);
             RECT rv = { MENU_W - 78, ry, MENU_W - 12, ry + 24 };
             DrawTextW(dc, val, -1, &rv, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
@@ -1195,12 +1224,12 @@ static void ReleaseClick(bool left)
     if (down) { PostClick(left, false); down = false; }
 }
 
-static void EmitClicks(long& acc, int cps, bool left, DWORD dt)
+static void EmitClicks(double& acc, int cps10, bool left, DWORD dt)
 {
-    int interval = 1000 / cps;
-    if (interval < 1) interval = 1;
-    acc += (long)dt;
-    if (acc > interval * 3) acc = interval * 3;   // 防长时间暂停后爆发
+    double interval = 10000.0 / cps10;            // 0.1 CPS 精度: 毫秒间隔含小数
+    if (interval < 1.0) interval = 1.0;
+    acc += (double)dt;
+    if (acc > interval * 3.0) acc = interval * 3.0;   // 防长时间暂停后爆发
     int n = 0;
     while (acc >= interval && n < 2) {
         acc -= interval;
@@ -1243,8 +1272,8 @@ static void ClickTick(HDC hdc)
 
     if (!lActive) { ReleaseClick(true);  g_accL = 0; }
     if (!rActive) { ReleaseClick(false); g_accR = 0; }
-    if (lActive) EmitClicks(g_accL, g_s.cpsLeft,  true,  dt);
-    if (rActive) EmitClicks(g_accR, g_s.cpsRight, false, dt);
+    if (lActive) EmitClicks(g_accL, g_s.cpsLeft10,  true,  dt);
+    if (rActive) EmitClicks(g_accR, g_s.cpsRight10, false, dt);
 }
 
 //--------------------------------------------------------------------------
@@ -2712,9 +2741,11 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
             Log("dllmain: init, peb-hidden=%d, HOOK-INSTALL-FAIL",
                 PebStillVisible(hInst) ? 0 : 1);
         } else {
-            Log("dllmain: init, peb-hidden=%d, hook-ok, settings master=%d left=%d right=%d cps=%d/%d keep=%d gates=%d/%d/%d",
+            Log("dllmain: init, peb-hidden=%d, hook-ok, settings master=%d left=%d right=%d cps=%d.%d/%d.%d keep=%d gates=%d/%d/%d",
                 PebStillVisible(hInst) ? 0 : 1,
-                g_s.master, g_s.left, g_s.right, g_s.cpsLeft, g_s.cpsRight,
+                g_s.master, g_s.left, g_s.right,
+                g_s.cpsLeft10 / 10, g_s.cpsLeft10 % 10,
+                g_s.cpsRight10 / 10, g_s.cpsRight10 % 10,
                 g_s.keep, g_s.gatk, g_s.gplace, g_s.gcursor);
         }
     }

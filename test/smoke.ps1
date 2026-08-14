@@ -27,8 +27,8 @@ New-Item -ItemType Directory -Force -Path $iniDir | Out-Null
 master=1
 left=1
 right=1
-cpsLeft=20
-cpsRight=20
+cpsLeft10=205
+cpsRight10=200
 keep=1
 gatk=0
 gplace=0
